@@ -1242,7 +1242,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.23.0';
+const TOOL_VERSION = '1.24.0';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
@@ -1294,6 +1294,9 @@ const state = {
   nsdeviceidstatus: null, // parsed nsdeviceidstatus.json (rule version)
   bwanFlows:     null,  // { tunnelFlows[], directFlows[] } from nsbwandebuglog
   bwanTunnel:    null,  // { hubIp, vip, routes[], pathCount, connected } from nsbwanclient
+  infiotOverlay:     null,  // parsed infiot-overlay.json
+  infiotExclusions:  null,  // parsed infiot-exclusions.json
+  infiotAppx:        null,  // parsed raw_inf_config.json (AppX QoS policies)
   identity: null,     // { username, email, domain, upn, source }
   zipFilename: null,
   epdlp: null,        // { version, user, deviceId, os, timezone, status, fallback, bypass, policyFingerprint, policyLastLoad }
@@ -1824,6 +1827,14 @@ function processFiles() {
     if (state.files['nsdeviceidstatus.json']) {
       try { state.nsdeviceidstatus = JSON.parse(state.files['nsdeviceidstatus.json']); } catch {}
     }
+    if (state.files['infiot-overlay.json']) {
+      try { state.infiotOverlay = JSON.parse(state.files['infiot-overlay.json']); } catch {}
+    }
+    if (state.files['infiot-exclusions.json']) {
+      try { state.infiotExclusions = JSON.parse(state.files['infiot-exclusions.json']); } catch {}
+    }
+    const _appxSrc = state.files['raw_inf_config.json'] || state.files['inf_config.json'];
+    if (_appxSrc) { try { state.infiotAppx = JSON.parse(_appxSrc); } catch {} }
 
     if (state.files['appInfo.log']) {
       state.appInfo = parseAppInfoLog(state.files['appInfo.log']);
@@ -4391,6 +4402,127 @@ const ISSUE_PATTERNS = [
     recommend: 'Check publisher health in the Netskope console. Verify network path stability between the client and publisher. Check if a network change event is cycling NPA reconnects.',
     source: 'GTF — temporal flap detection',
   },
+
+  // ── SD-WAN GTF Convergence — Chunk 1 patterns ─────────────────────────────
+  {
+    id: 'bwan-keepalive-burst', category: 'sdwan',
+    title: 'SD-WAN Keep-Alive Failures — Rapid Burst Detected',
+    severity: 'high', icon: '💔',
+    match: () => false,
+    matchState: s => {
+      const debugRows = Object.entries(s.parsedLogs)
+        .filter(([k]) => /^nsbwandebug/i.test(k))
+        .flatMap(([, r]) => r);
+      const kaRows = debugRows
+        .filter(r => /keep.alive.*fail|keep alive failed|No rx for/i.test(r.msg))
+        .sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
+      if (kaRows.length < 3) return false;
+      const tsMs = ts => ts ? Date.parse(ts.slice(0,10).replace(/\//g,'-') + 'T' + ts.slice(11,23) + 'Z') : 0;
+      let burst = false;
+      for (let i = 0; i <= kaRows.length - 3; i++) {
+        if (tsMs(kaRows[i+2].ts) - tsMs(kaRows[i].ts) <= 60000) { burst = true; break; }
+      }
+      if (!burst) return false;
+      return `${kaRows.length} keep-alive failure(s) in nsbwandebuglog — ≥3 within a 60-second window`;
+    },
+    desc: 'The SD-WAN hub keep-alive probes are failing in rapid bursts (≥3 within 60 seconds). This indicates the hub is unreachable or unresponsive. Tunnel teardown is imminent or has occurred, cutting all SD-WAN routed connectivity until the tunnel re-establishes.',
+    recommend: 'Check hub WAN reachability. Verify the firewall allows DTLS/UDP 4500 traffic to the hub IP. Review the SD-WAN panel for correlated tunnel disconnect events. Check hub-side health in the Endpoint SD-WAN management console.',
+    source: 'GTF C-SDWAN-KEEPALIVE',
+  },
+  {
+    id: 'bwan-ssl-loop', category: 'sdwan',
+    title: 'SD-WAN SSL/DTLS Handshake Loop — Stuck Connection',
+    severity: 'high', icon: '🔁',
+    match: () => false,
+    matchState: s => {
+      const clientRows = Object.entries(s.parsedLogs)
+        .filter(([k]) => /^(?:nsbwan|bwan)client/i.test(k))
+        .flatMap(([, r]) => r)
+        .sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
+      const sslRows = clientRows.filter(r => /ssl.*connect|dtls.*connect|handshake.*start|tls.*handshake/i.test(r.msg));
+      if (sslRows.length < 5) return false;
+      const connRows = clientRows.filter(r => /tunnel.*connected|PATH_COUNT:\s*[1-9]|connected.*tunnel/i.test(r.msg));
+      const tsMs = ts => ts ? Date.parse(ts.slice(0,10).replace(/\//g,'-') + 'T' + ts.slice(11,23) + 'Z') : 0;
+      let stuckMs = 0;
+      let cur = null;
+      for (const r of sslRows) {
+        const ms = tsMs(r.ts);
+        if (!cur) { cur = { start: ms, end: ms, count: 1 }; }
+        else if (ms - cur.end <= 60000) { cur.end = ms; cur.count++; }
+        else { cur = { start: ms, end: ms, count: 1 }; }
+        if (cur.end - cur.start >= 60000) {
+          const hasConnect = connRows.some(c => { const cm = tsMs(c.ts); return cm >= cur.start && cm <= cur.end + 10000; });
+          if (!hasConnect && (cur.end - cur.start) > stuckMs) stuckMs = cur.end - cur.start;
+        }
+      }
+      if (!stuckMs) return false;
+      const fmtMs = ms => ms < 60000 ? Math.round(ms/1000)+'s' : ms < 3600000 ? Math.round(ms/60000)+' min' : Math.round(ms/3600000*10)/10+' hr';
+      return `SD-WAN SSL/DTLS handshake stuck for ${fmtMs(stuckMs)} with no successful connection — tunnel loop detected`;
+    },
+    desc: 'The SD-WAN client is stuck in a sustained SSL/DTLS handshake retry loop with no successful connection for at least 60 seconds. Unlike SWG, SD-WAN has no TCP/TLS fallback, so all SD-WAN routed traffic is dropped during this window.',
+    recommend: 'Verify UDP 443 and UDP 4500 are open to the hub public IP on the local firewall. Check if a firewall or proxy is doing deep-packet inspection on DTLS traffic, which will break the handshake. Review the SD-WAN panel for the hub IP in use.',
+    source: 'GTF C-SDWAN-SSL-LOOP',
+  },
+  {
+    id: 'bwan-url-mismatch', category: 'sdwan',
+    title: 'SD-WAN Enrollment URL Mismatch — Stale Cached Config',
+    severity: 'warning', icon: '🔗',
+    match: () => false,
+    matchState: s => {
+      const bwanUrl = s.bwan?.bwanenrollmenturl || s.bwan?.bwanEnrollmentUrl;
+      const nsConfigUrl = s.config?.bwanenrollmenturl || s.config?.bwanEnrollmentUrl;
+      if (!bwanUrl || !nsConfigUrl) return false;
+      const norm = url => (url || '').replace(/\/$/, '').toLowerCase();
+      if (norm(bwanUrl) === norm(nsConfigUrl)) return false;
+      return `Enrollment URL in nsbwanconfig.json (${bwanUrl}) differs from nsconfig.json (${nsConfigUrl})`;
+    },
+    desc: 'The SD-WAN enrollment URL in nsbwanconfig.json (the client\'s runtime copy) does not match the URL in nsconfig.json (the admin-configured value). This indicates a stale cached SD-WAN config — the client hasn\'t picked up an admin URL change or has been re-enrolled to a different tenant.',
+    recommend: 'Wait ~2 minutes for the SD-WAN client to re-sync config (self-resolving after an admin change). If it persists, re-enroll the SD-WAN client or restart the nsbwanclient service to force a fresh config download.',
+    source: 'GTF W-SDWAN-CONFIG-MISMATCH',
+  },
+  {
+    id: 'bwan-failclose-captive', category: 'sdwan',
+    title: 'SD-WAN Fail-Close Active During Captive Portal Detection',
+    severity: 'high', icon: '🔐',
+    match: () => false,
+    matchState: s => {
+      const infiot = s.files?.['infiot-client-config.json'] || '';
+      if (!infiot) return false;
+      if (!/"failclose_enable"\s*:\s*true/i.test(infiot)) return false;
+      const allRows = Object.values(s.parsedLogs).flat();
+      const captiveHit = allRows.some(r => /captive.*portal|captive.*detect|portal.*detect|cert.*cn.*mismatch|gateway.*cert.*invalid/i.test(r.msg));
+      if (!captiveHit) return false;
+      return 'BWAN fail-close is enabled and a captive portal was detected — all traffic is blocked until the user authenticates to the portal';
+    },
+    desc: 'BWAN fail-close mode is active and the client has detected a captive portal (hotel, airport, or coffee shop Wi-Fi that requires login). With fail-close enabled, ALL traffic is blocked while the tunnel is down — the user cannot reach the captive portal login page to authenticate, creating a connectivity deadlock.',
+    recommend: 'Configure a captive portal grace period in the SD-WAN fail-close policy to temporarily allow HTTP/HTTPS traffic for portal authentication. In the Netskope console, set a captive portal exemption window (recommended: 5–15 minutes). Until then, the user must disable the NS Client, authenticate to the captive portal, then re-enable.',
+    source: 'GTF fail-close + captive portal checks',
+  },
+  {
+    id: 'bwan-sdwan-flap', category: 'sdwan',
+    title: 'SD-WAN Path Flapping — Rapid PATH_COUNT Drops',
+    severity: 'warning', icon: '📉',
+    match: () => false,
+    matchState: s => {
+      const clientRows = Object.entries(s.parsedLogs)
+        .filter(([k]) => /^(?:nsbwan|bwan)client/i.test(k))
+        .flatMap(([, r]) => r)
+        .sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
+      const dropRows = clientRows.filter(r => /PATH_COUNT:\s*0\b/i.test(r.msg));
+      if (dropRows.length < 2) return false;
+      const tsMs = ts => ts ? Date.parse(ts.slice(0,10).replace(/\//g,'-') + 'T' + ts.slice(11,23) + 'Z') : 0;
+      let rapidDrops = 0;
+      for (let i = 0; i < dropRows.length - 1; i++) {
+        if (tsMs(dropRows[i+1].ts) - tsMs(dropRows[i].ts) <= 180000) rapidDrops++;
+      }
+      if (rapidDrops < 2) return false;
+      const switchRows = clientRows.filter(r => /Switching active hub VIP from/i.test(r.msg));
+      return `${dropRows.length} PATH_COUNT=0 drop(s)${switchRows.length ? `, ${switchRows.length} hub VIP switch(es)` : ''} — rapid SD-WAN path flapping detected`;
+    },
+    desc: 'The SD-WAN active path is repeatedly dropping to 0 (no viable path) with rapid recovery cycles. This pattern indicates persistent WAN instability, intermediate network packet loss, or hub availability issues causing intermittent SD-WAN outages.',
+    recommend: 'Check ISP link health, latency, and packet loss to the hub IP. Verify upstream firewall UDP 4500 session table timers are not too aggressive. If hub VIP switches are also occurring, check the hub group configuration for load balancing vs. primary/backup topology.',
+    source: 'GTF SD-WAN flap detection',
+  },
 ];
 
 // Category metadata for rendering
@@ -5582,6 +5714,10 @@ function renderSysInfo() {
     panels.dem = { icon: '📡', label: 'DEM', html: diSection('DEM Configuration', d.demServiceEnabled ? 'Enabled' : 'Disabled', diKvGridRaw(demRows), true) };
   }
 
+  // SD-WAN panel
+  const sdwanPanelHtml = buildSdwanPanel();
+  if (sdwanPanelHtml.trim()) panels.sdwan = { icon: '🌐', label: 'SD-WAN', html: sdwanPanelHtml };
+
   // AI Discovery panel
   if (state.aiDiscovery) {
     const aid = state.aiDiscovery;
@@ -5603,7 +5739,7 @@ function renderSysInfo() {
 
   // ── Order panels ─────────────────────────────────────────────────
   const orderedPanels = {};
-  ['summary','enrollment','clientconfig','epdlp','steering','devclass','network','apps','bypass','hotfixes','dem','aidiscovery','system'].forEach(k => {
+  ['summary','enrollment','clientconfig','epdlp','steering','devclass','network','apps','bypass','hotfixes','dem','sdwan','aidiscovery','system'].forEach(k => {
     if (panels[k]) orderedPanels[k] = panels[k];
   });
 
@@ -6248,6 +6384,132 @@ function buildNpaExceptionsCard() {
       ${colHTML(onPrem,  'on',  'On-Prem')}
     </div>
   </div>`;
+}
+
+function buildSdwanPanel() {
+  let html = '';
+
+  // ── 1. Hub Group Config (infiot-overlay.json) ──
+  const overlay = state.infiotOverlay;
+  if (overlay?.local) {
+    const loc = overlay.local;
+    const idRows = [
+      ['Tenant ID',       loc.tenantID       || '—'],
+      ['Site ID',         loc.siteid          || '—'],
+      ['Hostname',        loc.hostname        || '—'],
+      ['MAC Address',     loc.macaddr         || '—'],
+      ['Overlay IP',      loc.overlayIP       || '—'],
+      ['Overlay Netmask', loc.overlayNetmask  || '—'],
+    ];
+    let hubHtml = diKvGrid(idRows);
+    const hops = loc.nexthop || [];
+    if (hops.length) {
+      hubHtml += `<div style="overflow-x:auto;margin-top:8px"><table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Hub IP</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">WAN IP</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Port</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Mode</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Cost</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Group</th>
+        </tr></thead><tbody>
+        ${hops.map(h => `<tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:3px 8px;font-family:monospace">${esc(h.ipv4||'—')}</td>
+          <td style="padding:3px 8px;font-family:monospace">${esc(h.wanip||'—')}</td>
+          <td style="padding:3px 8px">${esc(String(h.port||'—'))}</td>
+          <td style="padding:3px 8px">${esc(h.mode||'—')}</td>
+          <td style="padding:3px 8px">${esc(String(h.cost||'0'))}</td>
+          <td style="padding:3px 8px">${esc(h.groupname||'—')}</td>
+        </tr>`).join('')}
+        </tbody></table></div>`;
+    }
+    html += diSection('Hub Group Config', `${hops.length} hub${hops.length!==1?'s':''} · infiot-overlay.json`, hubHtml, true);
+  }
+
+  // ── 2. AppX Policy (raw_inf_config.json) ──
+  const appx = state.infiotAppx;
+  if (appx?.activated_policies?.[0]?.policy_config) {
+    const ap  = appx.activated_policies[0];
+    const pc  = ap.policy_config;
+    const policyName = ap.apc_name || ap.policy_name || '—';
+    const policies   = pc.pcfg_qos_policies || [];
+    const cosTable   = pc.pcfg_cos_table || [];
+    let appxHtml = diKvGrid([
+      ['Policy Name', policyName],
+      ['QoS Rules',   String(policies.length)],
+      ['CoS Queues',  String(cosTable.length)],
+    ]);
+    if (policies.length) {
+      appxHtml += `<div style="overflow-x:auto;margin-top:8px"><table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">#</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Rule Name</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Match Type</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Priority</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Traffic Class</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Hub</th>
+        </tr></thead><tbody>
+        ${policies.map((p, i) => {
+          const m = p.qos_match || {};
+          const a = p.qos_action || {};
+          const hub = a.pbr_action?.pbr_next_hop_site || '—';
+          return `<tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:3px 8px;color:var(--muted)">${i+1}</td>
+            <td style="padding:3px 8px">${esc(m.cmap_name||'Unnamed')}</td>
+            <td style="padding:3px 8px">${esc(m.cmap_match_type||'—')}</td>
+            <td style="padding:3px 8px">${esc(String(a.traffic_action?.priority||'—'))}</td>
+            <td style="padding:3px 8px">${esc(String(a.traffic_action?.class||'—'))}</td>
+            <td style="padding:3px 8px">${esc(hub)}</td>
+          </tr>`;
+        }).join('')}
+        </tbody></table></div>`;
+    }
+    html += diSection('AppX Policy', `${policies.length} rules · raw_inf_config.json`, appxHtml, false);
+  }
+
+  // ── 3. Traffic Exclusions (infiot-exclusions.json) ──
+  const excl = state.infiotExclusions;
+  if (excl) {
+    const ipRanges = excl.excluded_ip_ranges || [];
+    const procs    = excl.excluded_process_list || [];
+    let exclHtml = diKvGrid([
+      ['IP Ranges',          String(ipRanges.length)],
+      ['Excluded Processes', String(procs.length)],
+    ]);
+    if (ipRanges.length) {
+      exclHtml += `<div style="font-size:11px;font-weight:600;color:var(--muted);margin-top:10px;margin-bottom:4px">IP Ranges</div>
+        <div style="font-family:monospace;font-size:11px;max-height:120px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px 8px">
+          ${ipRanges.map(r => esc(r.cidr || (r.range_start + (r.range_end && r.range_end!==r.range_start ? '–'+r.range_end : '')))).join('<br>')}
+        </div>`;
+    }
+    if (procs.length) {
+      exclHtml += `<div style="font-size:11px;font-weight:600;color:var(--muted);margin-top:10px;margin-bottom:4px">Excluded Processes</div>
+        <div style="font-family:monospace;font-size:11px;max-height:80px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px 8px">
+          ${procs.map(p => esc(String(p))).join('<br>')}
+        </div>`;
+    }
+    html += diSection('Traffic Exclusions', `${ipRanges.length} IP range${ipRanges.length!==1?'s':''}, ${procs.length} process${procs.length!==1?'es':''} · infiot-exclusions.json`, exclHtml, false);
+  }
+
+  // ── 4. Keep-Alive Failures (nsbwandebuglog) ──
+  const debugRows = Object.entries(state.parsedLogs)
+    .filter(([k]) => /^nsbwandebug/i.test(k))
+    .flatMap(([, r]) => r);
+  const kaRows = debugRows.filter(r => /keep.alive.*fail|keep alive failed|No rx for/i.test(r.msg));
+  if (kaRows.length) {
+    const kaHtml = `<div style="padding:4px 0 0">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">${kaRows.length} keep-alive failure event${kaRows.length!==1?'s':''} in nsbwandebuglog</div>
+      <div style="font-family:monospace;font-size:11px;max-height:160px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:4px 8px">
+        ${kaRows.slice(0,20).map(r =>
+          `<div style="border-bottom:1px solid var(--border);padding:3px 0"><span style="color:var(--muted)">${esc(r.ts||'')}</span> <span style="color:#f85149">${esc(r.msg||'')}</span></div>`
+        ).join('')}
+        ${kaRows.length > 20 ? `<div style="color:var(--muted);padding:4px 0">…and ${kaRows.length-20} more</div>` : ''}
+      </div>
+    </div>`;
+    html += diSection('Keep-Alive Failures', `${kaRows.length} event${kaRows.length!==1?'s':''}`, kaHtml, kaRows.length >= 3);
+  }
+
+  return html;
 }
 
 function npaExcFilter(q) {
