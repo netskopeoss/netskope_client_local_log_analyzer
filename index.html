@@ -1255,7 +1255,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.28.0';
+const TOOL_VERSION = '1.28.1';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
@@ -5427,8 +5427,9 @@ function renderFindingCard(d) {
       <div class="fc-examples" id="fc-ex-${d.id}"${exOpen ? '' : ' style="display:none"'}>
         ${renderExamples(d.examples)}
         <div style="padding:5px 8px;border-top:1px solid var(--border);display:flex;justify-content:flex-end">
-          <button class="fc-log-btn" onclick="jumpToLogViewer(${JSON.stringify(logSearchTerm)})"
-            title="Open Log Viewer pre-filtered to this pattern" style="font-size:10px">↗ Log Viewer</button>
+          <button class="fc-log-btn" data-log-term="${esc(logSearchTerm)}"
+            title="Open Log Viewer pre-filtered to this pattern" style="font-size:10px"
+            onclick="jumpToLogViewer(this.dataset.logTerm)">↗ Log Viewer</button>
         </div>
       </div>` : ''}`;
 
@@ -5590,7 +5591,7 @@ function _renderFindingsNavHtml(inner, findings) {
     return;
   }
   inner.innerHTML = findings.map(f =>
-    `<div onclick="jumpToLogFinding(${JSON.stringify(f.searchTerm)})"
+    `<div data-term="${esc(f.searchTerm)}"
       style="display:flex;align-items:center;gap:8px;padding:7px 14px;cursor:pointer;border-bottom:1px solid var(--border)"
       onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
       <span style="font-size:9px;font-weight:700;color:${f.color};text-transform:uppercase;min-width:48px">${esc(f.severity)}</span>
@@ -5598,6 +5599,9 @@ function _renderFindingsNavHtml(inner, findings) {
       <span style="font-size:10px;color:var(--muted);flex-shrink:0">${f.count.toLocaleString()}×</span>
     </div>`
   ).join('');
+  inner.querySelectorAll('[data-term]').forEach(el => {
+    el.addEventListener('click', () => jumpToLogFinding(el.dataset.term));
+  });
 }
 
 function updateFindingsBtn(count) {
