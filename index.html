@@ -1025,6 +1025,13 @@ body {
       <select class="file-select" id="log-file-select"></select>
       <button id="log-allfiles-btn" class="filter-btn" onclick="toggleGlobalSearch(this)"
         title="Search across all log files in time order" style="font-size:11px;padding:3px 10px">🌐 All Files</button>
+      <div style="position:relative;flex-shrink:0">
+        <button id="log-findings-btn" class="filter-btn" onclick="toggleFindingsNav()"
+          title="Jump to a pattern match in this log file" style="font-size:11px;padding:3px 10px">📌 Findings <span id="log-findings-count"></span></button>
+        <div id="log-findings-nav" style="display:none;position:absolute;top:calc(100% + 4px);left:0;z-index:500;background:var(--bg2);border:1px solid var(--border);border-radius:8px;min-width:360px;max-height:320px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.25)">
+          <div id="log-findings-nav-inner"></div>
+        </div>
+      </div>
       <input class="search-box" id="log-search" placeholder="🔍  Search logs…" oninput="onSearch()" onkeydown="if(event.key==='Enter'){event.preventDefault();onSearch();}">
       <button type="button" id="log-regex-btn" class="filter-btn" onclick="toggleLogRegex(this)" title="Toggle regular expression search" style="font-size:12px;padding:3px 8px;font-family:monospace">.*</button>
       <button type="button" id="log-invert-btn" class="filter-btn" onclick="toggleLogInvert(this)" title="Invert: show lines NOT matching the search" style="font-size:13px;padding:3px 8px">⊘</button>
@@ -1038,7 +1045,7 @@ body {
         <button class="filter-btn active-error"   data-level="error"   onclick="toggleLevel(this)">ERROR</button>
         <button class="filter-btn active-warning" data-level="warning" onclick="toggleLevel(this)">WARN</button>
         <button class="filter-btn active-info"    data-level="info"    onclick="toggleLevel(this)">INFO</button>
-        <button class="filter-btn active-debug"   data-level="debug"   onclick="toggleLevel(this)">DEBUG</button>
+        <button class="filter-btn"                  data-level="debug"   onclick="toggleLevel(this)">DEBUG</button>
       </div>
       <button id="log-sort-btn" class="filter-btn" onclick="toggleLogSort()" title="Toggle sort order" style="font-size:11px;padding:3px 10px">↓ Newest</button>
       <select id="log-tz-select" class="file-select" title="Display timezone" onchange="onTzChange(this.value)" style="font-size:11px;max-width:160px">
@@ -1248,7 +1255,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.27.0';
+const TOOL_VERSION = '1.28.0';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
@@ -1273,7 +1280,8 @@ const state = {
   globalLogIndex:   null,   // merged time-sorted rows across all files (built lazily)
   globalSearchMode: false,  // true when All Files toggle is active
   dismissedIssues:  new Set(), // IDs of findings marked reviewed this session
-  activeLevels: new Set(['error','warning','warn','info','debug','trace']),
+  activeLevels: new Set(['error','warning','warn','info']),
+  _findingsCache: null,
   searchQuery: '',
   displayTz: '',        // '' = original, else IANA timezone string
   logHistoFilter: { minMs: 0, maxMs: 0 }, // active time-range brush filter
@@ -1734,6 +1742,7 @@ function processFiles() {
   state.logTimeRange = null;
   state.epdlpEvents = null;
   state.dismissedIssues = new Set();
+  state._findingsCache = null;
   setTimeout(() => {
     // Parse log files
     const logFiles = Object.keys(state.files).filter(n =>
@@ -5501,7 +5510,106 @@ function jumpToLogViewer(text) {
     el.value = text;
     el.dispatchEvent(new Event('input'));
     el.focus();
+    setTimeout(() => {
+      const vp = document.getElementById('log-viewport');
+      if (vp) vp.scrollTop = 0;
+    }, 260);
   }
+}
+
+// ─── Findings Quick-Nav ───────────────────────────────────────────────────────
+let _findingsNavOpen = false;
+
+function toggleFindingsNav() {
+  const nav = document.getElementById('log-findings-nav');
+  if (!nav) return;
+  _findingsNavOpen = !_findingsNavOpen;
+  if (_findingsNavOpen) {
+    buildFindingsNav();
+    nav.style.display = 'block';
+    setTimeout(() => document.addEventListener('click', _closeFindingsNavOutside, { once: true }), 0);
+  } else {
+    nav.style.display = 'none';
+  }
+}
+
+function _closeFindingsNavOutside(e) {
+  const nav = document.getElementById('log-findings-nav');
+  const btn = document.getElementById('log-findings-btn');
+  if (nav && !nav.contains(e.target) && e.target !== btn) {
+    _findingsNavOpen = false;
+    nav.style.display = 'none';
+  }
+}
+
+function buildFindingsNav() {
+  const inner = document.getElementById('log-findings-nav-inner');
+  if (!inner) return;
+
+  if (state.globalSearchMode) {
+    inner.innerHTML = '<div style="padding:12px 14px;color:var(--muted);font-size:12px">Switch to single-file mode to browse findings.</div>';
+    return;
+  }
+  const file = state.currentFile;
+  if (!file || !state.parsedLogs[file]) {
+    inner.innerHTML = '<div style="padding:12px 14px;color:var(--muted);font-size:12px">No log file selected.</div>';
+    return;
+  }
+  if (state._findingsCache?.file === file) {
+    _renderFindingsNavHtml(inner, state._findingsCache.findings);
+    return;
+  }
+
+  inner.innerHTML = '<div style="padding:12px 14px;color:var(--muted);font-size:12px">Scanning…</div>';
+  setTimeout(() => {
+    const rows = state.parsedLogs[file];
+    const SEV_COLOR = { high:'#f85149', medium:'#d29922', warning:'#d29922', low:'#3fb950', info:'#58a6ff' };
+    const findings = [];
+    for (const p of ISSUE_PATTERNS) {
+      if (!p.match) continue;
+      const matches = rows.filter(r => { try { return p.match(r); } catch { return false; } });
+      if (!matches.length) continue;
+      const raw = matches[0].raw || '';
+      const searchTerm = raw
+        .replace(/^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\s*/, '')
+        .replace(/^\[\S+:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\s*/, '')
+        .slice(0, 80).trim();
+      findings.push({ id: p.id, title: p.title, severity: p.severity, count: matches.length, searchTerm, color: SEV_COLOR[p.severity] || '#888' });
+    }
+    const sevOrder = { high: 0, medium: 1, warning: 2, low: 3, info: 4 };
+    findings.sort((a, b) => (sevOrder[a.severity] ?? 5) - (sevOrder[b.severity] ?? 5));
+    state._findingsCache = { file, findings };
+    _renderFindingsNavHtml(inner, findings);
+  }, 0);
+}
+
+function _renderFindingsNavHtml(inner, findings) {
+  updateFindingsBtn(findings.length);
+  if (!findings.length) {
+    inner.innerHTML = `<div style="padding:12px 14px;color:var(--muted);font-size:12px">No pattern matches in ${esc(state.currentFile || 'this file')}.</div>`;
+    return;
+  }
+  inner.innerHTML = findings.map(f =>
+    `<div onclick="jumpToLogFinding(${JSON.stringify(f.searchTerm)})"
+      style="display:flex;align-items:center;gap:8px;padding:7px 14px;cursor:pointer;border-bottom:1px solid var(--border)"
+      onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
+      <span style="font-size:9px;font-weight:700;color:${f.color};text-transform:uppercase;min-width:48px">${esc(f.severity)}</span>
+      <span style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f.title)}</span>
+      <span style="font-size:10px;color:var(--muted);flex-shrink:0">${f.count.toLocaleString()}×</span>
+    </div>`
+  ).join('');
+}
+
+function updateFindingsBtn(count) {
+  const span = document.getElementById('log-findings-count');
+  if (span) span.textContent = count ? `(${count})` : '';
+}
+
+function jumpToLogFinding(searchTerm) {
+  _findingsNavOpen = false;
+  const nav = document.getElementById('log-findings-nav');
+  if (nav) nav.style.display = 'none';
+  jumpToLogViewer(searchTerm);
 }
 
 function toggleFindingExamples(id, btn) {
@@ -6772,7 +6880,7 @@ function populateFileSelect() {
     opt.textContent = `${f} (${state.parsedLogs[f].length.toLocaleString()} lines)`;
     sel.appendChild(opt);
   });
-  sel.onchange = () => { state.currentFile = sel.value; state.logHistoFilter = { minMs: 0, maxMs: 0 }; applyFilters(); updateFlowFilters(); };
+  sel.onchange = () => { state.currentFile = sel.value; state.logHistoFilter = { minMs: 0, maxMs: 0 }; state._findingsCache = null; updateFindingsBtn(0); applyFilters(); updateFlowFilters(); };
   if (files.length > 0) {
     // Default to nsdebuglog.log if present, else first
     const pref = files.find(f => f === 'nsdebuglog.log') || files[0];
@@ -6799,10 +6907,13 @@ function toggleLevel(btn) {
   const activeClass = 'active-' + level;
   if (btn.classList.contains(activeClass)) {
     btn.classList.remove(activeClass);
-    // Add both forms
     if (level === 'warning') {
       state.activeLevels.delete('warning');
       state.activeLevels.delete('warn');
+    } else if (level === 'debug') {
+      state.activeLevels.delete('debug');
+      state.activeLevels.delete('trace');
+      state.activeLevels.delete('verbose');
     } else {
       state.activeLevels.delete(level);
     }
@@ -6811,6 +6922,10 @@ function toggleLevel(btn) {
     if (level === 'warning') {
       state.activeLevels.add('warning');
       state.activeLevels.add('warn');
+    } else if (level === 'debug') {
+      state.activeLevels.add('debug');
+      state.activeLevels.add('trace');
+      state.activeLevels.add('verbose');
     } else {
       state.activeLevels.add(level);
     }
@@ -9040,12 +9155,12 @@ fileInput.addEventListener('change', () => {
 function clearData() {
   Object.keys(state).forEach(k => {
     if (typeof state[k] === 'object' && state[k] !== null) {
-      if (state[k] instanceof Set) state[k] = new Set(['error','warning','warn','info','debug','trace']);
+      if (state[k] instanceof Set) state[k] = new Set(['error','warning','warn','info']);
       else if (Array.isArray(state[k])) state[k] = [];
       else state[k] = {};
     } else { state[k] = null; }
   });
-  state.activeLevels = new Set(['error','warning','warn','info','debug','trace']);
+  state.activeLevels = new Set(['error','warning','warn','info']);
   state.filteredRows = [];
   state.searchQuery  = '';
   state.logCompiledRe    = null;
@@ -9054,8 +9169,17 @@ function clearData() {
   state.dismissedIssues  = new Set();
   state.globalLogIndex   = null;
   state.globalSearchMode = true;
+  state._findingsCache   = null;
   const gBtn = document.getElementById('log-allfiles-btn');
   if (gBtn) gBtn.classList.add('active');
+  // Reset level filter buttons to reflect new defaults (DEBUG off)
+  document.querySelectorAll('#level-filters .filter-btn').forEach(b => {
+    const lvl = b.dataset.level;
+    const active = (lvl !== 'debug');
+    b.classList.toggle('active-' + lvl, active);
+    if (lvl === 'warning') b.classList.toggle('active-warning', active);
+  });
+  updateFindingsBtn(0);
   const sp = document.getElementById('log-single-pane');
   const gp = document.getElementById('log-global-pane');
   if (sp) sp.style.display = 'none';
