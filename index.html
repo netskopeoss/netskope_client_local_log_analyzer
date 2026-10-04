@@ -6389,6 +6389,40 @@ function buildNpaExceptionsCard() {
 function buildSdwanPanel() {
   let html = '';
 
+  // ── 0. BWAN Status (nsbwanconfig.json + nsbwanclient) ──
+  const bwan   = state.bwan;
+  const tunnel = state.bwanTunnel;
+  if (bwan || tunnel?.connected) {
+    const enrollUrl = bwan?.bwanenrollmenturl || bwan?.bwanEnrollmentUrl || '—';
+    const connected = tunnel?.connected ? 'Connected' : 'Disconnected';
+    const connColor = tunnel?.connected ? '#3fb950' : '#f85149';
+    const statusRows = [
+      ['Enrollment URL', enrollUrl],
+      ['Tunnel Status',  `<span style="color:${connColor};font-weight:600">${connected}</span>`],
+    ];
+    if (tunnel?.connected) {
+      if (tunnel.hubIp)    statusRows.push(['Hub IP',    tunnel.hubIp]);
+      if (tunnel.vip)      statusRows.push(['Client VIP', tunnel.vip]);
+      if (tunnel.pathCount != null) statusRows.push(['Active Paths', String(tunnel.pathCount)]);
+    }
+    // add any top-level bwan config fields that are informative
+    if (bwan?.site_id || bwan?.siteId)         statusRows.push(['Site ID', bwan.site_id || bwan.siteId]);
+    if (bwan?.tenant_id || bwan?.tenantId)     statusRows.push(['Tenant ID', String(bwan.tenant_id || bwan.tenantId)]);
+    if (bwan?.hub_group || bwan?.hubGroup)     statusRows.push(['Hub Group', bwan.hub_group || bwan.hubGroup]);
+    let bwanHtml = diKvGridRaw(statusRows);
+    if (tunnel?.routes?.length) {
+      bwanHtml += `<div style="font-size:11px;font-weight:600;color:var(--muted);margin-top:10px;margin-bottom:4px">Advertised Routes (${tunnel.routes.length})</div>
+        <div style="font-family:monospace;font-size:11px;max-height:100px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:4px 8px">
+          ${tunnel.routes.slice(0,30).map(r => `${esc(r.cidr||r)} <span style="color:var(--muted)">via ${esc(r.via||'hub')}</span>`).join('<br>')}
+          ${tunnel.routes.length > 30 ? `<br><span style="color:var(--muted)">…and ${tunnel.routes.length-30} more</span>` : ''}
+        </div>`;
+    }
+    const subtitle = tunnel?.connected
+      ? `Connected · hub ${esc(tunnel.hubIp||'?')} · ${tunnel.pathCount != null ? tunnel.pathCount+' path'+( tunnel.pathCount!==1?'s':'') : ''}`
+      : (enrollUrl !== '—' ? `Enrolled · ${enrollUrl}` : 'Not connected');
+    html += diSection('BWAN Status', subtitle, bwanHtml, true);
+  }
+
   // ── 1. Hub Group Config (infiot-overlay.json) ──
   const overlay = state.infiotOverlay;
   if (overlay?.local) {
