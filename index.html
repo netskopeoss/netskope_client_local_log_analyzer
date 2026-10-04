@@ -1585,6 +1585,9 @@ function extractConfigInfo(cfg) {
 async function loadZip(file) {
   showLoading('Loading ZIP…');
   state.zipFilename = file.name;
+  // Clear files from any previous load so stale data cannot bleed into the new parse
+  state.files = {};
+  state.pcaps = {};
   try {
     // Read the raw bytes first via file.arrayBuffer() (modern Blob stream path).
     // Passing a File directly to JSZip uses its internal FileReader path, which
@@ -1693,6 +1696,44 @@ async function loadZip(file) {
 
 function processFiles() {
   showLoading('Parsing logs…');
+  // Reset all derived state so a second file load starts clean
+  state.parsedLogs = {};
+  state.currentFile = null;
+  state.filteredRows = [];
+  state.globalLogIndex = null;
+  state.globalSearchMode = false;
+  state.logHistoFilter = { minMs: 0, maxMs: 0 };
+  state.logCompiledRe = null;
+  state.sysinfo = {};
+  state.metrics = null;
+  state.config = null;
+  state.dem = null;
+  state.traffic = null;
+  state.gslb = null;
+  state.gslbFile = null;
+  state.gslbAutoFallback = false;
+  state.npa = null;
+  state.steering = null;
+  state.nsuser = null;
+  state.bypass = null;
+  state.bwan = null;
+  state.npaExceptions = null;
+  state.appInfo = null;
+  state.networkState = null;
+  state.devState = null;
+  state.nsdeviceid = null;
+  state.nsdeviceidstatus = null;
+  state.bwanFlows = null;
+  state.bwanTunnel = null;
+  state.infiotOverlay = null;
+  state.infiotExclusions = null;
+  state.infiotAppx = null;
+  state.identity = null;
+  state.epdlp = null;
+  state.aiDiscovery = null;
+  state.logTimeRange = null;
+  state.epdlpEvents = null;
+  state.dismissedIssues = new Set();
   setTimeout(() => {
     // Parse log files
     const logFiles = Object.keys(state.files).filter(n =>
