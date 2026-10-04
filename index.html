@@ -1255,7 +1255,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.28.1';
+const TOOL_VERSION = '1.28.2';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
@@ -5506,6 +5506,20 @@ function copyFindingToCase(id, btn) {
 
 function jumpToLogViewer(text) {
   setActiveTab('logs');
+  // Reset modes so the jump always produces a clean plain-text search
+  if (state.globalSearchMode) {
+    const gBtn = document.getElementById('log-allfiles-btn');
+    if (gBtn) toggleGlobalSearch(gBtn);
+  }
+  if (state.logRegexMode) {
+    state.logRegexMode = false;
+    state.logCompiledRe = null;
+    document.getElementById('log-regex-btn')?.classList.remove('regex-active');
+  }
+  if (state.logInvertMode) {
+    state.logInvertMode = false;
+    document.getElementById('log-invert-btn')?.classList.remove('invert-active');
+  }
   const el = document.getElementById('log-search');
   if (el) {
     el.value = text;
