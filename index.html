@@ -1248,7 +1248,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.25.0';
+const TOOL_VERSION = '1.26.0';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
@@ -4575,6 +4575,39 @@ const ISSUE_PATTERNS = [
     recommend: 'Check ISP link health, latency, and packet loss to the hub IP. Verify upstream firewall UDP 4500 session table timers are not too aggressive. If hub VIP switches are also occurring, check the hub group configuration for load balancing vs. primary/backup topology.',
     source: 'GTF SD-WAN flap detection',
   },
+
+  // ── Device Details patterns ──────────────────────────────────────────────────
+  {
+    id: 'net-dup-ip', category: 'config',
+    title: 'Duplicate IP Address on Multiple Adapters',
+    severity: 'high', icon: '🔌',
+    match: () => false,
+    matchState: s => {
+      const nics = (s.networkState?.nics || []).filter(n => n.active && n.ip && n.ip !== '127.0.0.1' && !n.ip.startsWith('169.254.'));
+      const seen = {};
+      for (const n of nics) (seen[n.ip] = seen[n.ip] || []).push(n.name);
+      const dups = Object.entries(seen).filter(([, names]) => names.length > 1);
+      if (!dups.length) return false;
+      return dups.map(([ip, names]) => `${ip} on [${names.join(', ')}]`).join('; ');
+    },
+    desc: 'Two or more active network adapters share the same IPv4 address. This causes unpredictable routing and typically indicates a Netskope virtual adapter IP collision with a physical NIC or a misconfigured network stack.',
+    recommend: 'Check Network Adapter settings and the Netskope virtual NIC IP range. If the Netskope adapter (e.g. "Netskope Adapter") shares an IP with a physical interface, look for a DHCP conflict or static IP misconfiguration. Re-enrolling the client or resetting the virtual adapter IP may resolve this.',
+  },
+  {
+    id: 'dem-probe-high-loss', category: 'config',
+    title: 'DEM Probe High Packet Loss',
+    severity: 'warning', icon: '📡',
+    match: () => false,
+    matchState: s => {
+      const results = s.dem?.networkProbe?.results || s.dem?.probeResults || s.dem?.results || [];
+      if (!results.length) return false;
+      const bad = results.filter(r => (r.packet_loss ?? r.packetLoss ?? r.loss ?? 0) > 30);
+      if (!bad.length) return false;
+      return bad.map(r => `${r.target || r.name || 'probe'}: ${r.packet_loss ?? r.packetLoss ?? r.loss}% loss`).join(', ');
+    },
+    desc: 'One or more DEM network probe targets are showing greater than 30% packet loss at the time logs were collected. High probe loss correlates with SWG tunnel instability and slow application performance, and commonly precedes DEM high-RTT alerts.',
+    recommend: 'Run a continuous ping or MTR from the endpoint to each affected probe target. Check ISP link health and upstream path to the Netskope PoP. If a gateway probe target shows loss, check the GSLB assignment in the Netskope tenant and consider re-routing to a closer PoP.',
+  },
 ];
 
 // Category metadata for rendering
@@ -5626,9 +5659,25 @@ function renderSysInfo() {
   // Enrollment panel
   const enrollFields = ['User Email','Pre-Auth User','Tenant ID','Tenant Host','Org Key','Client Status Code'];
   const enrollRows = enrollFields.map(k => [k, s[k]]).filter(([,v]) => v);
+  const certExpiry = state.config?.cache?.user?.cert_expiry
+                  || state.config?.cache?.device?.cert_expiry
+                  || state.config?.user_cert_expiry
+                  || state.config?.cert_expiry;
+  if (certExpiry) enrollRows.push(['Cert Expiry', certExpiry]);
   let enrollHtml = '';
   if (enrollRows.length) enrollHtml += diSection('Identity', s['Tenant Host'] || s['Tenant ID'] || '', diKvGrid(enrollRows), true);
   if (ds && Object.keys(ds).length) enrollHtml += diSection('Device State', ds['Classification'] || '', diKvGrid(Object.entries(ds)), true);
+  // EPDLP policy details (already parsed from epdlp_status.json)
+  if (state.epdlp?.policyFingerprint || state.epdlp?.policyLastLoad) {
+    const ep = state.epdlp;
+    const epRows = [
+      ep.policyFingerprint ? ['Policy Fingerprint', ep.policyFingerprint.length > 16 ? ep.policyFingerprint.slice(0,16)+'…' : ep.policyFingerprint] : null,
+      ep.policyLastLoad    ? ['Policy Last Load',   ep.policyLastLoad]   : null,
+      ep.processLastStart  ? ['Process Started',    ep.processLastStart] : null,
+      ep.policyUpdateFreq  ? ['Update Frequency',   ep.policyUpdateFreq] : null,
+    ].filter(Boolean);
+    if (epRows.length) enrollHtml += diSection('EPDLP Policy', ep.policyFingerprint?.slice(0,8) || '', diKvGrid(epRows), false);
+  }
   if (enrollHtml) panels.enrollment = { icon: '🔑', label: 'Enrollment', html: enrollHtml };
 
   // Client Config panel
@@ -5763,7 +5812,38 @@ function renderSysInfo() {
       ...(d.networkProbe ? [['Probe Name', esc(d.networkProbe.name)],['Frequency', esc(d.networkProbe.frequency+'m')]] : []),
       ...(d.npa ? [['NPA Targets', esc(d.npa.join(', '))]] : []),
     ];
-    panels.dem = { icon: '📡', label: 'DEM', html: diSection('DEM Configuration', d.demServiceEnabled ? 'Enabled' : 'Disabled', diKvGridRaw(demRows), true) };
+    let demHtml = diSection('DEM Configuration', d.demServiceEnabled ? 'Enabled' : 'Disabled', diKvGridRaw(demRows), true);
+    // Per-probe results table
+    const probeResults = d.networkProbe?.results || d.probeResults || d.results || [];
+    if (probeResults.length) {
+      const totalRtt = probeResults.reduce((sum, r) => sum + (r.rtt_avg ?? r.rttAvg ?? r.rtt ?? 0), 0);
+      const avgRtt = Math.round(totalRtt / probeResults.length);
+      const badCount = probeResults.filter(r => (r.packet_loss ?? r.packetLoss ?? r.loss ?? 0) > 0).length;
+      const metaStr = `${probeResults.length} target${probeResults.length !== 1 ? 's' : ''} · ${avgRtt} ms avg${badCount ? ` · ⚠️ ${badCount} with loss` : ''}`;
+      let tbl = `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Target</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">RTT avg</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Packet Loss</th>
+          <th style="text-align:left;padding:4px 8px;color:var(--muted)">Status</th>
+        </tr></thead><tbody>`;
+      for (const r of probeResults) {
+        const rtt  = r.rtt_avg ?? r.rttAvg ?? r.rtt;
+        const loss = r.packet_loss ?? r.packetLoss ?? r.loss ?? 0;
+        const st   = r.status || (loss === 0 ? 'ok' : loss > 30 ? 'unreachable' : 'degraded');
+        const stColor = (st === 'ok' || st === 'reachable') ? '#3fb950' : loss > 30 ? '#f85149' : '#e3b341';
+        const lossColor = loss > 30 ? '#f85149' : loss > 10 ? '#e3b341' : 'inherit';
+        tbl += `<tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:3px 8px;font-family:monospace">${esc(r.target || r.name || '—')}</td>
+          <td style="padding:3px 8px;font-variant-numeric:tabular-nums">${rtt != null ? Math.round(rtt) + ' ms' : '—'}</td>
+          <td style="padding:3px 8px;font-variant-numeric:tabular-nums;color:${lossColor}">${loss}%</td>
+          <td style="padding:3px 8px"><span style="color:${stColor}">●</span> ${esc(st)}</td>
+        </tr>`;
+      }
+      tbl += `</tbody></table></div>`;
+      demHtml += diSection('Probe Results', metaStr, tbl, probeResults.length <= 8);
+    }
+    panels.dem = { icon: '📡', label: 'DEM', html: demHtml };
   }
 
   // SD-WAN panel
