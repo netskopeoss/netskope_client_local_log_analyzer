@@ -1248,7 +1248,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.26.0';
+const TOOL_VERSION = '1.27.0';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
@@ -9074,252 +9074,384 @@ function clearData() {
 
 // ─── Export Report ────────────────────────────────────────────────────────────
 function exportReport() {
-  const lines = [];
   const s = state.sysinfo;
-  const hr = (char = '─', w = 72) => char.repeat(w);
-  const section = title => {
-    lines.push('', hr(), `  ${title}`, hr(), '');
-  };
-  const row = (key, val) => val != null && val !== '' && lines.push(`  ${key.padEnd(28)} ${val}`);
-  const indent = (text, pad = 4) => lines.push(' '.repeat(pad) + text);
+  const H = t => t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
-  // ── Header ────────────────────────────────────────────────────────────────
-  lines.push(hr('═'));
-  lines.push('  NETSKOPE CLIENT DIAGNOSTIC REPORT');
-  lines.push(`  Generated: ${new Date().toISOString().replace('T',' ').slice(0,19)} UTC`);
-  if (state.zipFilename) lines.push(`  Source ZIP: ${state.zipFilename}`);
-  lines.push(hr('═'));
-
-  // ── Device Info ───────────────────────────────────────────────────────────
-  section('DEVICE INFORMATION');
-  const devFields = ['Hostname','OS Name','OS Version','System Model','System Manufacturer',
-    'Processor','Total Physical Memory','Available Physical Memory',
-    'System Boot Time','Time Zone','Domain','Serial Number'];
-  devFields.forEach(k => row(k + ':', s[k]));
-
-  // ── Netskope Client ───────────────────────────────────────────────────────
-  section('NETSKOPE CLIENT');
-  const nsFields = ['NS Client Version','Tenant ID','Tenant Host','Org Key','Gateway',
-    'Gateway POP','Tunnel Status','Steering Config','Client Config','Traffic Mode',
-    'User Email','UPN','Pre-Auth User','Fail Close','Last Connected IP',
-    'Tunnel Status Code','NPA Status Code','Client Status Code','Device Classification'];
-  nsFields.forEach(k => row(k + ':', s[k]));
-  if (state.identity) {
-    const id = state.identity;
-    if (id.email) row('Identity (Email):', id.email);
-    if (id.upn)   row('Identity (UPN):', id.upn);
-    if (id.domain) row('Domain:', id.domain);
-  }
-
-  // ── Detected Issues ───────────────────────────────────────────────────────
-  section('DETECTED ISSUES');
+  // ── Collect findings ──────────────────────────────────────────────────────
   const allLogs = Object.values(state.parsedLogs).flat();
   const detected = [];
   for (const pattern of ISSUE_PATTERNS) {
     if (pattern.matchConfig) {
-      try { if (pattern.matchConfig(state.config)) detected.push({ ...pattern, count:1, detail:null }); } catch {}
+      try { if (pattern.matchConfig(state.config)) detected.push({ ...pattern, count:1, detail:null, examples:[] }); } catch {}
       continue;
     }
     if (pattern.matchState) {
       try {
         const r = pattern.matchState(state);
-        if (r) detected.push({ ...pattern, count:1, detail: typeof r === 'string' ? r : null });
+        if (r) detected.push({ ...pattern, count:1, detail: typeof r === 'string' ? r : null, examples:[] });
       } catch {}
       continue;
     }
     const matches = allLogs.filter(r => { try { return pattern.match(r); } catch { return false; } });
     if (matches.length) {
       const detail = pattern.summarize ? pattern.summarize(matches) : null;
-      detected.push({ ...pattern, count: matches.length, detail,
-        examples: matches.slice(0,3).map(r => r.raw) });
+      detected.push({ ...pattern, count: matches.length, detail, examples: matches.slice(0,2).map(r => r.raw) });
     }
   }
   const sevOrder = { high: 0, medium: 1, warning: 2, low: 3, info: 4 };
-  detected.sort((a,b) => sevOrder[a.severity] - sevOrder[b.severity]);
+  detected.sort((a,b) => (sevOrder[a.severity]??5) - (sevOrder[b.severity]??5));
 
-  if (!detected.length) {
-    lines.push('  No issues detected.');
+  // ── Log time range ────────────────────────────────────────────────────────
+  const ltr = state.logTimeRange;
+  const fmtTs = ts => ts ? ts.slice(0,10).replace(/\//g,'-') + ' ' + ts.slice(11,19) : '';
+  const logRange = ltr ? `${fmtTs(ltr.first)} → ${fmtTs(ltr.last)} UTC` : '';
+
+  // ── Case summary paragraph ────────────────────────────────────────────────
+  const hostname = s['Hostname'] || 'unknown host';
+  const os = [s['OS Name'], s['OS Version']].filter(Boolean).join(' ');
+  const user = s['User Email'] || state.identity?.email || '';
+  const clientVer = s['NS Client Version'] || '';
+  const nHigh = detected.filter(d => d.severity === 'high').length;
+  const nWarn = detected.filter(d => d.severity === 'warning' || d.severity === 'medium').length;
+  const topFinding = detected[0];
+  let summaryPara = `Diagnostic analysis of <strong>${H(hostname)}</strong>`;
+  if (os) summaryPara += ` (${H(os)})`;
+  if (user) summaryPara += `, user <strong>${H(user)}</strong>`;
+  if (clientVer) summaryPara += `, Netskope Client <strong>${H(clientVer)}</strong>`;
+  summaryPara += '.';
+  if (logRange) summaryPara += ` Logs span ${H(logRange)}.`;
+  if (detected.length === 0) {
+    summaryPara += ' No diagnostic issues detected.';
   } else {
-    const high     = detected.filter(d => d.severity === 'high').length;
-    const medium   = detected.filter(d => d.severity === 'medium').length;
-    const info     = detected.filter(d => d.severity === 'info').length;
-    const reviewed = state.dismissedIssues.size;
-    lines.push(`  ${detected.length} findings — ${high} HIGH · ${medium} MEDIUM · ${info} INFO${reviewed ? ` · ${reviewed} marked reviewed` : ''}`);
-    lines.push('');
+    summaryPara += ` Found <strong>${detected.length} finding${detected.length > 1 ? 's' : ''}</strong>`;
+    if (nHigh) summaryPara += ` including <strong style="color:#c0392b">${nHigh} HIGH</strong>`;
+    if (nWarn) summaryPara += `${nHigh ? ' and' : ' including'} ${nWarn} warning${nWarn > 1 ? 's' : ''}`;
+    summaryPara += '.';
+    if (topFinding) summaryPara += ` Top finding: ${H(topFinding.title)}.`;
+  }
 
+  // ── Severity helpers ──────────────────────────────────────────────────────
+  const SEV_COLOR  = { high:'#c0392b', medium:'#d68910', warning:'#d68910', low:'#1a7a4a', info:'#2471a3' };
+  const SEV_BG     = { high:'#fdf2f2', medium:'#fdf6e3', warning:'#fdf6e3', low:'#f0f9f4', info:'#eaf4fb' };
+  const SEV_BG_DK  = { high:'#2d1010', medium:'#2d2200', warning:'#2d2200', low:'#0d2414', info:'#0d1f2d' };
+  const SEV_BORDER = { high:'#e74c3c', medium:'#f39c12', warning:'#f39c12', low:'#27ae60', info:'#3498db' };
+
+  // ── Build findings HTML ───────────────────────────────────────────────────
+  let findingsHtml = '';
+  if (!detected.length) {
+    findingsHtml = '<p style="color:#555;font-style:italic">No diagnostic issues detected.</p>';
+  } else {
     for (const d of detected) {
-      const isReviewed = state.dismissedIssues.has(d.id);
-      lines.push(`  [${d.severity.toUpperCase().padEnd(6)}] ${d.icon || '•'} ${d.title}${isReviewed ? '  ✓ REVIEWED' : ''}`);
-      if (d.detail)     indent(`Data:        ${d.detail}`);
-      if (d.desc)       indent(`Description: ${d.desc}`);
-      if (d.recommend)  indent(`Recommend:   ${d.recommend}`);
-      if (d.count > 1)  indent(`Occurrences: ${d.count.toLocaleString()}`);
-      if (d.examples?.length) {
-        indent('Examples:');
-        (d.examples || []).forEach(e => indent(e.slice(0, 120), 8));
-      }
-      lines.push('');
+      const reviewed = state.dismissedIssues.has(d.id);
+      const sev = d.severity || 'info';
+      const bc = SEV_BORDER[sev] || '#888';
+      const bgL = SEV_BG[sev] || '#f9f9f9';
+      const bgD = SEV_BG_DK[sev] || '#1a1a1a';
+      const sc = SEV_COLOR[sev] || '#555';
+      const actionLine = d.actionEasy || d.desc || '';
+      const recommendLine = d.recommend || '';
+      findingsHtml += `<div class="finding" style="border-left:4px solid ${bc};background:${bgL};margin:0 0 12px;padding:12px 14px;border-radius:0 6px 6px 0" data-bg-dark="${bgD}">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="font-size:11px;font-weight:700;color:${sc};text-transform:uppercase;letter-spacing:.05em;background:${bc}22;padding:2px 7px;border-radius:3px">${H(sev)}</span>
+          <span style="font-weight:600;font-size:13px">${d.icon ? H(d.icon)+' ' : ''}${H(d.title)}</span>
+          ${reviewed ? '<span style="font-size:11px;color:#27ae60;margin-left:auto">✓ Reviewed</span>' : ''}
+        </div>
+        ${d.detail ? `<p style="margin:0 0 6px;font-size:12px;font-family:monospace;color:#555;word-break:break-all">${H(d.detail)}</p>` : ''}
+        ${actionLine ? `<p style="margin:0 0 6px;font-size:13px">${H(actionLine)}</p>` : ''}
+        ${recommendLine ? `<p style="margin:0;font-size:12px;color:#444"><strong>Recommend:</strong> ${H(recommendLine)}</p>` : ''}
+        ${d.count > 1 ? `<p style="margin:4px 0 0;font-size:11px;color:#777">${d.count.toLocaleString()} occurrences</p>` : ''}
+        ${(d.examples||[]).length ? `<details style="margin-top:6px"><summary style="font-size:11px;cursor:pointer;color:#555">Log examples</summary><div style="margin-top:4px">${(d.examples||[]).map(e=>`<div style="font-family:monospace;font-size:10px;word-break:break-all;color:#666;margin:2px 0">${H(e.slice(0,160))}</div>`).join('')}</div></details>` : ''}
+      </div>`;
     }
   }
 
-  // ── Traffic Summary ───────────────────────────────────────────────────────
-  if (state.traffic) {
-    section('TRAFFIC ANALYSIS');
-    const { processes = {}, hosts = {}, events = [] } = state.traffic;
-    const steered  = events.filter(e => e.type === 'tunnel').length;
-    const bypassed = events.filter(e => e.type === 'bypass').length;
-    lines.push(`  Total events: ${events.length.toLocaleString()}  (${steered.toLocaleString()} steered · ${bypassed.toLocaleString()} bypassed)`);
-    lines.push('');
+  // ── KV table helper ───────────────────────────────────────────────────────
+  const kvTable = rows => {
+    if (!rows.length) return '';
+    return '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+      rows.map(([k,v]) => `<tr style="border-bottom:1px solid #e8e8e8">
+        <td style="padding:4px 8px 4px 0;color:#666;white-space:nowrap;width:40%">${H(k)}</td>
+        <td style="padding:4px 0 4px 8px;font-family:${/^[0-9a-f:.]+$/i.test(String(v)) ? 'monospace' : 'inherit'}">${H(String(v))}</td>
+      </tr>`).join('') + '</table>';
+  };
 
-    const topProcs = Object.entries(processes)
-      .sort((a,b) => (b[1].steered + b[1].bypassed) - (a[1].steered + a[1].bypassed))
-      .slice(0, 15);
-    if (topProcs.length) {
-      lines.push('  Top Processes (steered / bypassed):');
-      topProcs.forEach(([name, p]) =>
-        indent(`${name.padEnd(38)}  ${String(p.steered).padStart(6)} / ${p.bypassed}`));
-      lines.push('');
-    }
+  // ── Section helper ────────────────────────────────────────────────────────
+  const sec = (title, contentHtml) => contentHtml
+    ? `<section style="margin-bottom:24px">
+        <h2 style="font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#888;border-bottom:1px solid #e0e0e0;padding-bottom:6px;margin:0 0 12px">${H(title)}</h2>
+        ${contentHtml}
+      </section>`
+    : '';
 
-    const topHosts = Object.entries(hosts)
-      .sort((a,b) => (b[1].steered + b[1].bypassed) - (a[1].steered + a[1].bypassed))
-      .slice(0, 15);
-    if (topHosts.length) {
-      lines.push('  Top Hosts (steered / bypassed):');
-      topHosts.forEach(([host, h]) =>
-        indent(`${host.padEnd(38)}  ${String(h.steered).padStart(6)} / ${h.bypassed}`));
-    }
+  // ── Device section ────────────────────────────────────────────────────────
+  const devRows = [
+    ['Hostname', s['Hostname']], ['OS', [s['OS Name'],s['OS Version']].filter(Boolean).join(' ')],
+    ['Model', s['System Model'] || s['Device Model']], ['Processor', s['Processor']],
+    ['Memory', s['Total Physical Memory']], ['Serial Number', s['Serial Number']],
+    ['Boot Time', s['System Boot Time']], ['Time Zone', s['Time Zone']], ['Domain', s['Domain']],
+  ].filter(([,v]) => v);
+
+  // ── Enrollment section ────────────────────────────────────────────────────
+  const enrRows = [
+    ['User', s['User Email'] || state.identity?.email],
+    ['Tenant Host', s['Tenant Host']], ['Tenant ID', s['Tenant ID']],
+    ['Client Version', s['NS Client Version']],
+    ['Client Config', s['Client Config']], ['Traffic Mode', s['Traffic Mode']],
+    ['Steering Config', s['Steering Config']],
+    ['Gateway', s['Gateway']], ['Gateway POP', s['Gateway POP']],
+    ['Tunnel Status', s['Tunnel Status Code'] ? `${s['Tunnel Status']} (${s['Tunnel Status Code']})` : s['Tunnel Status']],
+    ['Fail Close', s['Fail Close']], ['Client Status', s['Client Status Code']],
+    ['Last Connected IP', s['Last Connected IP']],
+  ].filter(([,v]) => v);
+
+  // ── Network section ───────────────────────────────────────────────────────
+  let netHtml = '';
+  if (state.networkState?.nics?.length) {
+    netHtml = '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+      '<thead><tr style="border-bottom:2px solid #e0e0e0">' +
+      '<th style="text-align:left;padding:4px 8px 4px 0;color:#666">Adapter</th>' +
+      '<th style="text-align:left;padding:4px 8px;color:#666">IP</th>' +
+      '<th style="text-align:left;padding:4px 8px;color:#666">MAC</th>' +
+      '<th style="text-align:left;padding:4px 8px;color:#666">GW</th>' +
+      '<th style="text-align:left;padding:4px 8px;color:#666">Status</th>' +
+      '</tr></thead><tbody>' +
+      state.networkState.nics.map(n => `<tr style="border-bottom:1px solid #f0f0f0">
+        <td style="padding:3px 8px 3px 0;font-size:11px">${H(n.name)}${n.desc?`<br><span style="color:#999;font-size:10px">${H(n.desc)}</span>`:''}</td>
+        <td style="padding:3px 8px;font-family:monospace">${H(n.ip||'—')}</td>
+        <td style="padding:3px 8px;font-family:monospace;font-size:10px">${H(n.mac||'—')}</td>
+        <td style="padding:3px 8px;font-family:monospace">${H(n.gw||'—')}</td>
+        <td style="padding:3px 8px"><span style="color:${n.active?'#27ae60':'#bbb'}">${n.active?'●':'○'}</span> ${n.active?'Active':'Down'}</td>
+      </tr>`).join('') + '</tbody></table>';
   }
 
-  // ── GSLB Summary ──────────────────────────────────────────────────────────
+  // ── GSLB section ─────────────────────────────────────────────────────────
+  let gslbHtml = '';
   if (state.gslb?.pops && Object.keys(state.gslb.pops).length) {
-    section('GSLB PERFORMANCE SUMMARY');
-    const pops = state.gslb.pops;
-    lines.push(`  Rounds: ${state.gslb.rounds?.length || 0}   PoPs measured: ${Object.keys(pops).length}`);
-    lines.push('');
-    lines.push(`  ${'PoP'.padEnd(28)} ${'Wins'.padStart(5)}  ${'Min'.padStart(6)}  ${'Avg'.padStart(6)}  ${'Max'.padStart(6)}  Timeouts`);
-    lines.push(`  ${hr('-', 68)}`);
-    const sorted = Object.entries(pops).sort((a,b) => b[1].wins - a[1].wins);
     const TIMEOUT = 500;
-    for (const [name, pop] of sorted) {
-      const real = pop.measurements.map(m => m.rtt).filter(v => v < TIMEOUT);
-      const timeouts = pop.measurements.length - real.length;
-      const avg = real.length ? Math.round(real.reduce((s,v) => s+v, 0) / real.length) : '—';
-      const min = real.length ? Math.min(...real) : '—';
-      const max = real.length ? Math.max(...real) : '—';
-      lines.push(`  ${name.padEnd(28)} ${String(pop.wins).padStart(5)}  ${String(min).padStart(5)}ms  ${String(avg).padStart(5)}ms  ${String(max).padStart(5)}ms  ${timeouts}`);
-    }
+    const sorted = Object.entries(state.gslb.pops).sort((a,b) => b[1].wins - a[1].wins);
+    gslbHtml = `<p style="font-size:12px;margin:0 0 8px">Rounds: ${state.gslb.rounds?.length||0} · PoPs measured: ${sorted.length}</p>` +
+      '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+      '<thead><tr style="border-bottom:2px solid #e0e0e0">' +
+      '<th style="text-align:left;padding:4px 8px 4px 0;color:#666">PoP</th><th style="text-align:right;padding:4px 8px;color:#666">Wins</th>' +
+      '<th style="text-align:right;padding:4px 8px;color:#666">Min</th><th style="text-align:right;padding:4px 8px;color:#666">Avg</th>' +
+      '<th style="text-align:right;padding:4px 8px;color:#666">Max</th><th style="text-align:right;padding:4px 8px;color:#666">T/O</th>' +
+      '</tr></thead><tbody>' +
+      sorted.map(([name, pop]) => {
+        const real = pop.measurements.map(m => m.rtt).filter(v => v < TIMEOUT);
+        const tos  = pop.measurements.length - real.length;
+        const avg  = real.length ? Math.round(real.reduce((a,v) => a+v, 0) / real.length) : '—';
+        const min  = real.length ? Math.min(...real) : '—';
+        const max  = real.length ? Math.max(...real) : '—';
+        const isTop = pop.wins > 0;
+        return `<tr style="border-bottom:1px solid #f0f0f0${isTop?';font-weight:600':''}">
+          <td style="padding:3px 8px 3px 0">${H(name)}</td>
+          <td style="padding:3px 8px;text-align:right">${pop.wins}</td>
+          <td style="padding:3px 8px;text-align:right;font-variant-numeric:tabular-nums">${min === '—'?'—':min+'ms'}</td>
+          <td style="padding:3px 8px;text-align:right;font-variant-numeric:tabular-nums">${avg === '—'?'—':avg+'ms'}</td>
+          <td style="padding:3px 8px;text-align:right;font-variant-numeric:tabular-nums">${max === '—'?'—':max+'ms'}</td>
+          <td style="padding:3px 8px;text-align:right;color:${tos>0?'#c0392b':'#bbb'}">${tos||'—'}</td>
+        </tr>`;
+      }).join('') + '</tbody></table>';
   }
 
-  // ── NPA Summary ───────────────────────────────────────────────────────────
+  // ── NPA section ───────────────────────────────────────────────────────────
+  let npaHtml = '';
   if (state.npa?.privateApps?.length || state.npa?.sessions?.length) {
-    section('NPA PRIVATE ACCESS');
-    if (state.npa.user) lines.push(`  User: ${state.npa.user}`);
-    lines.push('');
-
     const apps = state.npa.privateApps || [];
-    if (apps.length) {
-      lines.push(`  Private App Rules (${apps.length}):`);
-      lines.push(`  ${'App'.padEnd(32)} ${'Destination'.padEnd(28)} ${'Port'.padStart(6)}  Action`);
-      lines.push(`  ${hr('-', 72)}`);
-      apps.forEach(a =>
-        indent(`${(a.appName||'—').padEnd(30)}  ${(a.destHost||'—').padEnd(26)}  ${String(a.destPort||'—').padStart(5)}  ${a.action||'—'}`)
-      );
-      lines.push('');
-    }
-
     const sessions = state.npa.sessions || [];
+    if (state.npa.user) npaHtml += `<p style="font-size:12px;margin:0 0 8px">User: <strong>${H(state.npa.user)}</strong></p>`;
+    if (apps.length) {
+      npaHtml += '<p style="font-size:12px;font-weight:600;margin:0 0 4px">Private App Rules</p>' +
+        '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:12px">' +
+        '<thead><tr style="border-bottom:2px solid #e0e0e0"><th style="text-align:left;padding:3px 8px 3px 0;color:#666">App</th><th style="text-align:left;padding:3px 8px;color:#666">Destination</th><th style="text-align:left;padding:3px 8px;color:#666">Port</th><th style="text-align:left;padding:3px 8px;color:#666">Action</th></tr></thead><tbody>' +
+        apps.map(a => `<tr style="border-bottom:1px solid #f0f0f0"><td style="padding:2px 8px 2px 0">${H(a.appName||'—')}</td><td style="padding:2px 8px;font-family:monospace;font-size:11px">${H(a.destHost||'—')}</td><td style="padding:2px 8px">${H(String(a.destPort||'—'))}</td><td style="padding:2px 8px">${H(a.action||'—')}</td></tr>`).join('') +
+        '</tbody></table>';
+    }
     if (sessions.length) {
-      const ok       = sessions.filter(s => s.established).length;
-      const disc     = sessions.filter(s => s.disconnectTime).length;
-      const inFlight = sessions.filter(s => !s.disconnectTime).length;
-      lines.push(`  Tunnel Sessions: ${sessions.length}  (${ok} established · ${disc} disconnected · ${inFlight} in-flight)`);
+      const ok = sessions.filter(s => s.established).length;
+      const disc = sessions.filter(s => s.disconnectTime).length;
+      npaHtml += `<p style="font-size:12px;margin:0 0 4px">Sessions: ${sessions.length} · ${ok} established · ${disc} disconnected</p>`;
       const reasons = {};
       sessions.filter(s => s.reason).forEach(s => reasons[s.reason] = (reasons[s.reason]||0)+1);
       if (Object.keys(reasons).length) {
-        lines.push('  Disconnect Reasons:');
-        Object.entries(reasons).sort((a,b) => b[1]-a[1]).forEach(([r,n]) => indent(`${String(n).padStart(4)}×  ${r}`));
+        npaHtml += '<p style="font-size:12px;font-weight:600;margin:4px 0 2px">Disconnect reasons</p>' +
+          Object.entries(reasons).sort((a,b) => b[1]-a[1])
+            .map(([r,n]) => `<div style="font-size:12px;padding:1px 0">${n}× ${H(r)}</div>`).join('');
       }
     }
   }
 
-  // ── Cert-Pinned Bypass Inventory ──────────────────────────────────────────
-  if (state.bypass) {
-    const offApps = state.bypass?.['Off Prem']?.certPinnedAppList || [];
-    const onApps  = state.bypass?.['On Prem']?.certPinnedAppList  || [];
-    if (offApps.length || onApps.length) {
-      section('CERT-PINNED BYPASS APPS');
-      const STOCK = new Set([
-        'dropbox','github','zoom','crowdstrike','icloud','microsoft outlook',
-        'microsoft intune','apple app store','chatgpt','signal','adobe acrobat',
-        'citrix workspace','google drive file stream','netskope sd-wan',
-        'slack','webex','teams','box','servicenow','salesforce',
-      ]);
-      [[offApps, 'Off-Prem'], [onApps, 'On-Prem']].forEach(([apps, label]) => {
-        if (!apps.length) return;
-        lines.push(`  ${label} (${apps.length}):`);
-        apps.forEach(a => {
-          const stock = STOCK.has((a.appName||'').toLowerCase()) ? ' [stock]' : ' [custom]';
-          indent(`${(a.appName||'?').padEnd(34)}  ${(a.mode||'direct').padEnd(12)}${stock}`);
-        });
-        lines.push('');
-      });
+  // ── Traffic section ───────────────────────────────────────────────────────
+  let trafficHtml = '';
+  if (state.traffic) {
+    const { processes={}, hosts={}, events=[] } = state.traffic;
+    const steered  = events.filter(e => e.type==='tunnel').length;
+    const bypassed = events.filter(e => e.type==='bypass').length;
+    trafficHtml = `<p style="font-size:12px;margin:0 0 10px">Total: ${events.length.toLocaleString()} · ${steered.toLocaleString()} steered · ${bypassed.toLocaleString()} bypassed</p>`;
+    const topProcs = Object.entries(processes).sort((a,b) => (b[1].steered+b[1].bypassed)-(a[1].steered+a[1].bypassed)).slice(0,12);
+    const topHosts = Object.entries(hosts).sort((a,b) => (b[1].steered+b[1].bypassed)-(a[1].steered+a[1].bypassed)).slice(0,12);
+    const twoColTable = (label, rows, cols) => rows.length ? `<p style="font-size:12px;font-weight:600;margin:0 0 4px">${label}</p><table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:12px"><thead><tr style="border-bottom:1px solid #e0e0e0">${cols.map(c=>`<th style="text-align:left;padding:2px 8px 2px 0;color:#666">${c}</th>`).join('')}</tr></thead><tbody>${rows.map(([name,p])=>`<tr style="border-bottom:1px solid #f8f8f8"><td style="padding:2px 8px 2px 0;font-family:monospace;font-size:10px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${H(name)}</td><td style="padding:2px 8px;font-variant-numeric:tabular-nums">${p.steered.toLocaleString()}</td><td style="padding:2px 8px;font-variant-numeric:tabular-nums">${p.bypassed.toLocaleString()}</td></tr>`).join('')}</tbody></table>` : '';
+    trafficHtml += twoColTable('Top Processes', topProcs, ['Process','Steered','Bypassed']);
+    trafficHtml += twoColTable('Top Hosts', topHosts, ['Host','Steered','Bypassed']);
+  }
+
+  // ── EPDLP section ─────────────────────────────────────────────────────────
+  let epdlpHtml = '';
+  if (state.epdlp) {
+    const ep = state.epdlp;
+    const epRows = [
+      ['Device Status', ep.deviceStatus],
+      ['Policy Fingerprint', ep.policyFingerprint ? ep.policyFingerprint.slice(0,16)+'…' : null],
+      ['Policy Last Load', ep.policyLastLoad],
+      ['Process Started', ep.processLastStart],
+      ['Log Level', ep.logLevel],
+      ['Update Frequency', ep.policyUpdateFreq],
+    ].filter(([,v]) => v);
+    epdlpHtml = kvTable(epRows);
+  }
+
+  // ── SD-WAN section ────────────────────────────────────────────────────────
+  let sdwanHtml = '';
+  if (state.bwan || state.infiotOverlay) {
+    const bw = state.bwan || {};
+    const ov = state.infiotOverlay?.identity || {};
+    const sdRows = [
+      ['Enrollment URL', bw.bwanenrollmenturl || bw.bwanEnrollmentUrl],
+      ['Site ID', ov.siteid || bw.siteid],
+      ['Overlay IP', ov.overlayIP],
+      ['Tenant ID', ov.tenantID],
+      ['Connected', state.bwanTunnel?.connected ? 'Yes' : (state.bwanTunnel ? 'No' : null)],
+    ].filter(([,v]) => v);
+    sdwanHtml = kvTable(sdRows);
+  }
+
+  // ── DEM section ───────────────────────────────────────────────────────────
+  let demHtml = '';
+  if (state.dem) {
+    const d = state.dem;
+    const demRows = [
+      ['DEM Enabled', d.demServiceEnabled ? 'Yes' : 'No'],
+      ['Probe Name', d.networkProbe?.name],
+      ['Frequency', d.networkProbe?.frequency ? d.networkProbe.frequency + 'm' : null],
+    ].filter(([,v]) => v);
+    const probeResults = d.networkProbe?.results || d.probeResults || d.results || [];
+    demHtml = kvTable(demRows);
+    if (probeResults.length) {
+      const avgRtt = Math.round(probeResults.reduce((sum,r) => sum+(r.rtt_avg??r.rttAvg??r.rtt??0),0)/probeResults.length);
+      const badCount = probeResults.filter(r => (r.packet_loss??r.packetLoss??r.loss??0) > 0).length;
+      demHtml += `<p style="font-size:12px;font-weight:600;margin:10px 0 4px">Probe Results — ${probeResults.length} target${probeResults.length>1?'s':''} · ${avgRtt}ms avg${badCount?` · ⚠ ${badCount} with loss`:''}</p>` +
+        '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+        '<thead><tr style="border-bottom:1px solid #e0e0e0"><th style="text-align:left;padding:3px 8px 3px 0;color:#666">Target</th><th style="text-align:right;padding:3px 8px;color:#666">RTT avg</th><th style="text-align:right;padding:3px 8px;color:#666">Loss</th><th style="text-align:left;padding:3px 8px;color:#666">Status</th></tr></thead><tbody>' +
+        probeResults.map(r => {
+          const rtt  = r.rtt_avg??r.rttAvg??r.rtt;
+          const loss = r.packet_loss??r.packetLoss??r.loss??0;
+          const st   = r.status||(loss===0?'ok':'degraded');
+          const lc   = loss>30?'#c0392b':loss>10?'#d68910':'inherit';
+          const sc   = (st==='ok'||st==='reachable')?'#27ae60':loss>30?'#c0392b':'#d68910';
+          return `<tr style="border-bottom:1px solid #f0f0f0"><td style="padding:2px 8px 2px 0;font-family:monospace;font-size:11px">${H(r.target||r.name||'—')}</td><td style="padding:2px 8px;text-align:right;font-variant-numeric:tabular-nums">${rtt!=null?Math.round(rtt)+'ms':'—'}</td><td style="padding:2px 8px;text-align:right;color:${lc};font-variant-numeric:tabular-nums">${loss}%</td><td style="padding:2px 8px;color:${sc}">${H(st)}</td></tr>`;
+        }).join('') + '</tbody></table>';
     }
   }
 
-  // ── NPA Destination Exceptions ────────────────────────────────────────────
-  if (state.npaExceptions?.npa_exceptions) {
-    const exc = state.npaExceptions.npa_exceptions;
-    const bwanUrl = state.bwan?.bwanenrollmenturl || state.bwan?.bwanEnrollmentUrl;
-    const tunnelStr = JSON.stringify(state.bwan || '');
-    const tunnelM   = tunnelStr.match(/Active\s*\[Tunnels:(\d+)\]/i);
-    const tunnelCnt = tunnelM ? parseInt(tunnelM[1]) : null;
-
-    section(bwanUrl ? 'NPA → BWAN HANDOFF EXCEPTIONS' : 'NPA DESTINATION EXCEPTIONS');
-    if (bwanUrl) {
-      lines.push(`  BWAN Enrolled:  ${bwanUrl}`);
-      lines.push(`  Active Tunnels: ${tunnelCnt != null ? tunnelCnt : 'unknown'}`);
-      lines.push('');
-    }
-
-    [['off_prem', 'Off-Prem'], ['on_prem', 'On-Prem']].forEach(([key, label]) => {
-      const groups = exc[key] || [];
-      if (!groups.length) { lines.push(`  ${label}: (no exceptions)`); return; }
-      lines.push(`  ${label}:`);
-      groups.forEach(entry => {
-        (entry.destinations || []).forEach(dest => {
-          indent(`Group: ${dest.name || 'Unnamed'}`);
-          (dest.values || []).forEach(v => indent(v, 8));
-        });
-      });
-      lines.push('');
-    });
-  }
-
-  // ── Log File Summary ──────────────────────────────────────────────────────
+  // ── Log files section ─────────────────────────────────────────────────────
+  let logHtml = '';
   if (Object.keys(state.parsedLogs).length) {
-    section('LOG FILES');
-    Object.entries(state.parsedLogs)
+    const logRows = Object.entries(state.parsedLogs)
       .sort((a,b) => b[1].length - a[1].length)
-      .forEach(([fname, rows]) => {
-        const errs  = rows.filter(r => r.level === 'error').length;
-        const warns = rows.filter(r => r.level === 'warning' || r.level === 'warn').length;
-        const tag = errs ? ` [${errs}E ${warns}W]` : warns ? ` [${warns}W]` : '';
-        indent(`${fname.padEnd(32)}  ${String(rows.length).padStart(7)} lines${tag}`);
-      });
+      .map(([fname, rows]) => {
+        const errs  = rows.filter(r => r.level==='error').length;
+        const warns = rows.filter(r => r.level==='warning'||r.level==='warn').length;
+        return `<tr style="border-bottom:1px solid #f0f0f0">
+          <td style="padding:2px 8px 2px 0;font-family:monospace;font-size:11px">${H(fname)}</td>
+          <td style="padding:2px 8px;text-align:right;font-variant-numeric:tabular-nums">${rows.length.toLocaleString()}</td>
+          <td style="padding:2px 8px;text-align:right;color:${errs?'#c0392b':'#bbb'};font-variant-numeric:tabular-nums">${errs||'—'}</td>
+          <td style="padding:2px 8px;text-align:right;color:${warns?'#d68910':'#bbb'};font-variant-numeric:tabular-nums">${warns||'—'}</td>
+        </tr>`;
+      }).join('');
+    logHtml = '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+      '<thead><tr style="border-bottom:2px solid #e0e0e0"><th style="text-align:left;padding:3px 8px 3px 0;color:#666">File</th><th style="text-align:right;padding:3px 8px;color:#666">Lines</th><th style="text-align:right;padding:3px 8px;color:#666">Errors</th><th style="text-align:right;padding:3px 8px;color:#666">Warnings</th></tr></thead><tbody>' +
+      logRows + '</tbody></table>';
   }
 
-  // ── Footer ────────────────────────────────────────────────────────────────
-  lines.push('', hr('═'));
-  lines.push('  Netskope Log Analyzer — https://github.com/');
-  lines.push(hr('═'));
+  // ── Severity badge counts ─────────────────────────────────────────────────
+  const nHigh2 = detected.filter(d => d.severity==='high').length;
+  const nMed   = detected.filter(d => d.severity==='medium').length;
+  const nWar   = detected.filter(d => d.severity==='warning').length;
+  const nInf   = detected.filter(d => d.severity==='info').length;
+  const badgeHtml = [
+    nHigh2 && `<span style="background:#c0392b;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:700">${nHigh2} HIGH</span>`,
+    (nMed+nWar) && `<span style="background:#d68910;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:700">${nMed+nWar} WARNING</span>`,
+    nInf && `<span style="background:#2471a3;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:700">${nInf} INFO</span>`,
+  ].filter(Boolean).join(' ');
 
-  const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+  // ── Compose full HTML document ────────────────────────────────────────────
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Netskope Diagnostic Report — ${H(hostname)}</title>
+<style>
+  :root { --bg:#fff; --text:#1a1a1a; --muted:#666; --border:#e0e0e0; --bg2:#f7f7f7; }
+  @media (prefers-color-scheme:dark) {
+    :root { --bg:#161b22; --text:#e6edf3; --muted:#8b949e; --border:#30363d; --bg2:#21262d; }
+    .finding { background: attr(data-bg-dark) !important; }
+    td, th { color: var(--text) !important; border-color: var(--border) !important; }
+    table tr { border-color: var(--border) !important; }
+    p { color: var(--text) !important; }
+    details summary { color: var(--muted) !important; }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px; line-height:1.5; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  h2 { font-size:13px; }
+  .meta { font-size:12px; color:var(--muted); margin:0 0 20px; }
+  .summary-box { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:16px; margin:0 0 24px; font-size:13px; line-height:1.6; }
+  .badge-row { display:flex; gap:6px; flex-wrap:wrap; margin:10px 0 0; }
+  section { margin-bottom:24px; }
+  h2 { font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); border-bottom:1px solid var(--border); padding-bottom:6px; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th { text-align:left; padding:4px 8px 4px 0; color:var(--muted); border-bottom:2px solid var(--border); font-weight:600; }
+  td { padding:3px 8px 3px 0; border-bottom:1px solid var(--border); color:var(--text); }
+  td:not(:first-child), th:not(:first-child) { padding-left:8px; }
+  .finding p { color:var(--text) !important; }
+  footer { margin-top:32px; border-top:1px solid var(--border); padding-top:12px; font-size:11px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Netskope Client Diagnostic Report</h1>
+  <p class="meta">Generated ${new Date().toISOString().replace('T',' ').slice(0,19)} UTC${state.zipFilename ? ' · Source: '+H(state.zipFilename) : ''} · NLA v${H(TOOL_VERSION)}</p>
+
+  <div class="summary-box">
+    <p style="margin:0 0 8px">${summaryPara}</p>
+    ${badgeHtml ? `<div class="badge-row">${badgeHtml}</div>` : ''}
+  </div>
+
+  ${sec('Findings & Recommendations', findingsHtml)}
+  ${sec('Device Information', kvTable(devRows))}
+  ${sec('Netskope Enrollment', kvTable(enrRows))}
+  ${netHtml ? sec('Network Interfaces', netHtml) : ''}
+  ${gslbHtml ? sec('GSLB Performance', gslbHtml) : ''}
+  ${npaHtml ? sec('NPA Private Access', npaHtml) : ''}
+  ${trafficHtml ? sec('Traffic Analysis', trafficHtml) : ''}
+  ${epdlpHtml ? sec('EPDLP Status', epdlpHtml) : ''}
+  ${sdwanHtml ? sec('SD-WAN', sdwanHtml) : ''}
+  ${demHtml ? sec('DEM', demHtml) : ''}
+  ${sec('Log Files', logHtml)}
+
+  <footer>Netskope Log Analyzer v${H(TOOL_VERSION)} — diagnostic report generated offline, no data was transmitted.</footer>
+</div>
+</body>
+</html>`;
+
+  const blob = new Blob([html], { type: 'text/html' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  const hostname = (s['Hostname'] || 'unknown').replace(/[^a-zA-Z0-9_.-]/g, '_');
-  const ts = new Date().toISOString().slice(0,19).replace(/:/g,'-').replace('T','_');
-  a.download = `netskope-analysis-${hostname}-${ts}.txt`;
+  const safeHost = (s['Hostname'] || 'unknown').replace(/[^a-zA-Z0-9_.-]/g, '_');
+  const ts = new Date().toISOString().slice(0,10);
+  a.download = `netskope-diag-${safeHost}-${ts}.html`;
   document.body.appendChild(a);
   a.click();
   setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 1000);
