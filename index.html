@@ -981,6 +981,7 @@ body {
   <div class="tab" data-tab="traffic">🔄 Traffic</div>
   <div class="tab" data-tab="gslb">🌐 GSLB</div>
   <div class="tab" data-tab="npa">🔒 NPA</div>
+  <div class="tab" data-tab="epdlp">🛡️ EPDLP <span class="tab-badge info" id="tab-epdlp-count" style="display:none">0</span></div>
   <div class="tab" data-tab="aidiscovery">🤖 AI Discovery</div>
   <div class="tab" data-tab="flowpath">⚡ Flow Path</div>
   <div class="tab" data-tab="timeline">📈 Timeline</div>
@@ -1108,6 +1109,11 @@ body {
   <!-- NPA -->
   <div class="tab-panel" id="panel-npa">
     <div style="flex:1;overflow-y:auto;padding:16px" id="npa-content"></div>
+  </div>
+
+  <!-- EPDLP Events -->
+  <div class="tab-panel" id="panel-epdlp">
+    <div style="flex:1;overflow-y:auto;padding:16px" id="epdlp-events-content"></div>
   </div>
 
   <!-- AI Discovery -->
@@ -1242,7 +1248,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.24.0';
+const TOOL_VERSION = '1.25.0';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
@@ -1303,6 +1309,7 @@ const state = {
   aiDiscovery: null,  // parsed ai_discovery_gef_debug.json
   logTimeRange: null, // { first: 'YYYY/MM/DD HH:MM:SS', last: '...' } from parsed logs
   pcaps: {},          // filename -> ArrayBuffer for .pcap/.pcapng files
+  epdlpEvents: null,  // [{ts, uuid, result, action, rule, isFallback, activityType, srcFile, processName, username}]
 };
 
 const ROW_H = 20;
@@ -1903,6 +1910,51 @@ function processFiles() {
         } catch {}
       }
       state.epdlp = ep;
+    }
+
+    // ── EPDLP policy event parsing ────────────────────────────────────────────
+    {
+      const RE_EL  = /^(\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)\s+(?:\S+\.cpp:\d+\s+)?\d+\s+\d+\s+\[\w+\]\s*(.*)$/;
+      const RE_ING = /PolicyWorker\s+\d+:\s+evaluating\s+event\s+(\{.*\})\s*$/;
+      const RE_ED  = /PolicyWorker\s+\d+:\s+evaluated\s+event\s+([0-9a-f-]+)\s+with\s+result\s+"(\w+)"\s+with\s+action\s+"(\w+)"(?:\s+for\s+rule\s+"([^"]+)"|\s+and\s+no\s+rules\s+matched)/i;
+      const FALLBACKS = new Set(['Offline fallback', 'Error fallback', 'Max file size fallback']);
+      const logSrcs = ['epdlp_sys_log.log','epdlp_sys_log.1.log','epdlp_sys_log.2.log','epdlp_sys_log.3.log'].filter(f => state.files[f]);
+      if (logSrcs.length) {
+        const evtMap = new Map();
+        const evts = [];
+        for (const f of logSrcs) {
+          for (const line of state.files[f].split('\n')) {
+            const tm = line.match(RE_EL);
+            if (!tm) continue;
+            const [, ts, msg] = tm;
+            let m;
+            if ((m = msg.match(RE_ING))) {
+              try {
+                const j = JSON.parse(m[1]);
+                if (j.event_uuid) evtMap.set(j.event_uuid, j);
+              } catch {}
+            } else if ((m = msg.match(RE_ED))) {
+              const [, uuid, result, action, rule] = m;
+              const inp = evtMap.get(uuid) || {};
+              const r = rule || null;
+              evts.push({
+                ts, uuid, result, action,
+                rule: r || '(no rule matched)',
+                isFallback: FALLBACKS.has(r),
+                activityType: inp.activity_type   || '',
+                srcFile:      inp.source_file_path || '',
+                processName:  inp.process_name     || '',
+                username:     inp.username || inp.os_username || '',
+              });
+              if (evts.length >= 5000) break;
+            }
+          }
+          if (evts.length >= 5000) break;
+        }
+        state.epdlpEvents = evts;
+        const badge = document.getElementById('tab-epdlp-count');
+        if (badge) { badge.textContent = evts.length; badge.style.display = evts.length ? '' : 'none'; }
+      }
     }
 
     // ── AI Discovery state extraction ─────────────────────────────────────────
@@ -8028,6 +8080,135 @@ function tlCopyText() {
   });
 }
 
+// ─── EPDLP Events tab ─────────────────────────────────────────────────────────
+let _epdlpFilter = { action: 'all', q: '' };
+
+function renderEpdlpTab() {
+  const el = document.getElementById('epdlp-events-content');
+  if (!el) return;
+
+  const events = state.epdlpEvents;
+  if (!events) {
+    el.innerHTML = `<div style="padding:48px;text-align:center;color:var(--muted)">
+      <div style="font-size:32px;margin-bottom:12px">🛡️</div>
+      <div style="font-size:14px">No epdlp_sys_log.log present in this bundle.</div>
+      <div style="font-size:12px;margin-top:6px">EPDLP event logs are included when the endpoint runs R115+ with EPDLP licensed.</div>
+    </div>`;
+    return;
+  }
+  if (!events.length) {
+    el.innerHTML = `<div style="padding:48px;text-align:center;color:var(--muted)">
+      <div style="font-size:32px;margin-bottom:12px">🛡️</div>
+      <div style="font-size:14px">epdlp_sys_log.log found but contains no policy evaluation events.</div>
+      <div style="font-size:12px;margin-top:6px">Events only appear when EPDLP has inspected file operations.</div>
+    </div>`;
+    return;
+  }
+
+  const blocked  = events.filter(e => e.action === 'block').length;
+  const alerted  = events.filter(e => e.action === 'alert').length;
+  const allowed  = events.filter(e => e.action === 'allow').length;
+  const readonly = events.filter(e => e.action === 'readonly').length;
+  const noMatch  = events.filter(e => e.result === 'noMatch').length;
+  const fallbks  = events.filter(e => e.isFallback).length;
+
+  let filtered = events;
+  const fa = _epdlpFilter.action;
+  if (fa === 'nomatch') filtered = filtered.filter(e => e.result === 'noMatch');
+  else if (fa !== 'all') filtered = filtered.filter(e => e.action === fa);
+  if (_epdlpFilter.q) {
+    const q = _epdlpFilter.q.toLowerCase();
+    filtered = filtered.filter(e =>
+      (e.rule        || '').toLowerCase().includes(q) ||
+      (e.srcFile     || '').toLowerCase().includes(q) ||
+      (e.processName || '').toLowerCase().includes(q) ||
+      (e.username    || '').toLowerCase().includes(q) ||
+      (e.activityType|| '').toLowerCase().includes(q)
+    );
+  }
+
+  const AC = { block:'#f85149', alert:'#d29922', allow:'#3fb950', readonly:'#79c0ff', userAlert:'#e3b341' };
+  const AL = { block:'Blocked', alert:'Alerted', allow:'Allowed', readonly:'ReadOnly', userAlert:'User Alert' };
+  const ac = a => AC[a] || 'var(--muted)';
+  const al = a => AL[a] || a || '—';
+
+  const btn = (id, label, count) => {
+    const active = _epdlpFilter.action === id;
+    return `<button onclick="epdlpSetFilter('${id}')" style="padding:4px 10px;border-radius:3px;border:1px solid var(--border);cursor:pointer;font-size:11px;background:${active?'var(--primary)':'var(--surface)'};color:${active?'#000':'var(--text)'};">${label} (${count})</button>`;
+  };
+
+  const truncated = events.length >= 5000;
+  const shown = Math.min(filtered.length, 500);
+
+  el.innerHTML = `
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px">
+      <div>
+        <span style="font-size:14px;font-weight:600">${events.length.toLocaleString()} evaluation${events.length!==1?'s':''}</span>
+        ${truncated ? `<span style="font-size:11px;color:#d29922;margin-left:8px">⚠ capped at 5,000</span>` : ''}
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px">
+        ${blocked  ? `<span style="color:#f85149">● ${blocked} blocked</span>` : ''}
+        ${alerted  ? `<span style="color:#d29922">● ${alerted} alerted</span>` : ''}
+        ${allowed  ? `<span style="color:#3fb950">● ${allowed} allowed</span>` : ''}
+        ${readonly ? `<span style="color:#79c0ff">● ${readonly} read-only</span>` : ''}
+        ${noMatch  ? `<span style="color:var(--muted)">● ${noMatch} no match</span>` : ''}
+        ${fallbks  ? `<span style="color:#bc8cff">● ${fallbks} fallback</span>` : ''}
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:12px;align-items:center;flex-wrap:wrap">
+      ${btn('all',     'All',     events.length)}
+      ${blocked  ? btn('block',   'Blocked',  blocked)  : ''}
+      ${alerted  ? btn('alert',   'Alerted',  alerted)  : ''}
+      ${allowed  ? btn('allow',   'Allowed',  allowed)  : ''}
+      ${readonly ? btn('readonly','ReadOnly', readonly) : ''}
+      ${noMatch  ? btn('nomatch', 'No Match', noMatch)  : ''}
+      <input id="epdlp-search" class="search-box" placeholder="🔍 Rule, file, process, user…"
+        value="${esc(_epdlpFilter.q)}"
+        oninput="epdlpSearch(this.value)"
+        style="margin-left:auto;width:260px;font-size:12px;padding:4px 8px">
+    </div>
+    ${filtered.length !== events.length ? `<div style="font-size:11px;color:var(--muted);margin-bottom:6px">${filtered.length.toLocaleString()} matching</div>` : ''}
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:800px">
+        <thead><tr style="border-bottom:2px solid var(--border)">
+          <th style="text-align:left;padding:6px 10px;color:var(--muted);font-weight:600;white-space:nowrap">Timestamp</th>
+          <th style="text-align:left;padding:6px 10px;color:var(--muted);font-weight:600">Action</th>
+          <th style="text-align:left;padding:6px 10px;color:var(--muted);font-weight:600">Result</th>
+          <th style="text-align:left;padding:6px 10px;color:var(--muted);font-weight:600">Rule</th>
+          <th style="text-align:left;padding:6px 10px;color:var(--muted);font-weight:600">Activity</th>
+          <th style="text-align:left;padding:6px 10px;color:var(--muted);font-weight:600">File / Source</th>
+          <th style="text-align:left;padding:6px 10px;color:var(--muted);font-weight:600">Process</th>
+        </tr></thead>
+        <tbody>
+          ${filtered.slice(0, 500).map(e => `<tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:5px 10px;font-family:monospace;font-size:10px;white-space:nowrap;color:var(--muted)">${esc(e.ts)}</td>
+            <td style="padding:5px 10px;white-space:nowrap">
+              <span style="color:${ac(e.action)};font-weight:600;font-size:11px">${al(e.action)}</span>
+              ${e.isFallback ? `<span style="color:#bc8cff;font-size:10px;margin-left:4px">fallback</span>` : ''}
+            </td>
+            <td style="padding:5px 10px;font-size:11px;color:${e.result==='match'?'#3fb950':'var(--muted)'}">${esc(e.result||'—')}</td>
+            <td style="padding:5px 10px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.rule)}">${esc(e.rule||'—')}</td>
+            <td style="padding:5px 10px;font-size:11px;color:var(--muted);white-space:nowrap">${esc(e.activityType||'—')}</td>
+            <td style="padding:5px 10px;font-family:monospace;font-size:10px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.srcFile)}">${esc(e.srcFile||'—')}</td>
+            <td style="padding:5px 10px;font-size:11px;color:var(--muted);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.processName)}">${esc(e.processName||'—')}</td>
+          </tr>`).join('')}
+          ${!filtered.length ? `<tr><td colspan="7" style="padding:32px;text-align:center;color:var(--muted)">No events match the current filter</td></tr>` : ''}
+          ${filtered.length > 500 ? `<tr><td colspan="7" style="padding:8px 10px;color:var(--muted);text-align:center;font-size:11px">…${(filtered.length-500).toLocaleString()} more — narrow with search or action filter</td></tr>` : ''}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+function epdlpSetFilter(action) {
+  _epdlpFilter.action = action;
+  renderEpdlpTab();
+}
+
+function epdlpSearch(q) {
+  _epdlpFilter.q = q;
+  renderEpdlpTab();
+}
+
 // ─── Tabs ─────────────────────────────────────────────────────────────────────
 function setActiveTab(tab) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
@@ -8040,6 +8221,7 @@ function setActiveTab(tab) {
   if (tab === 'timeline') setTimeout(renderTimeline, 0);
   if (tab === 'configfiles') setTimeout(renderConfigFiles, 0);
   if (tab === 'pcap') setTimeout(renderPcapTab, 0);
+  if (tab === 'epdlp') setTimeout(renderEpdlpTab, 0);
 }
 
 function toggleBetaTabs(enabled) {
