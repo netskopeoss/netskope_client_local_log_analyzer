@@ -92,18 +92,31 @@ body {
 
 /* ── Device bar ── */
 #device-bar {
-  background: var(--bg3);
+  background: var(--bg1);
   border-bottom: 1px solid var(--border);
-  padding: 6px 16px;
+  padding: 8px 16px;
   display: none;
-  gap: 24px;
+  gap: 6px;
   align-items: center;
   flex-wrap: wrap;
   flex-shrink: 0;
 }
-.dev-field { display: flex; align-items: center; gap: 5px; font-size: 12px; }
-.dev-label { color: var(--muted); }
-.dev-value { color: var(--text); font-weight: 500; }
+.dev-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 12px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 0.12s, background 0.12s;
+  min-width: 68px;
+}
+.dev-chip.clickable { cursor: pointer; }
+.dev-chip:hover { border-color: var(--primary, #58a6ff); background: rgba(88,166,255,0.07); }
+.dev-chip-label { font-size: 9px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); margin-bottom: 2px; }
+.dev-chip-value { font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+.dev-chip-sub { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; margin-top: 1px; }
 .badge {
   display: inline-flex;
   align-items: center;
@@ -1281,7 +1294,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.28.4';
+const TOOL_VERSION = '1.29.0';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
@@ -2112,9 +2125,9 @@ function renderAll() {
   document.getElementById('btn-clear').style.display = 'inline-flex';
   document.getElementById('btn-export').style.display = 'inline-flex';
 
+  renderFindings();
   renderDeviceBar();
   renderDashboard();
-  renderFindings();
   renderSysInfo();
   renderTraffic();
   renderGSLB();
@@ -2133,41 +2146,78 @@ function renderAll() {
 
 function renderDeviceBar() {
   const bar = document.getElementById('device-bar');
-  const s = state.sysinfo;
+  if (!bar) return;
+  const s  = state.sysinfo;
   const id = state.identity || {};
-  const fields = [];
 
-  // Best available user identity: UPN from ZIP filename > email from logs > username+domain > raw username
+  const chip = (label, value, sub, { clickable, onclick, valueColor, subColor } = {}) => {
+    if (!value) return '';
+    const cls      = 'dev-chip' + (clickable ? ' clickable' : '');
+    const handler  = onclick ? ` onclick="${onclick}"` : '';
+    const valStyle = valueColor ? ` style="color:${valueColor}"` : '';
+    const subStyle = subColor   ? ` style="color:${subColor}"` : '';
+    return `<div class="${cls}"${handler}>
+      <div class="dev-chip-label">${label}</div>
+      <div class="dev-chip-value"${valStyle}>${esc(String(value))}</div>
+      ${sub ? `<div class="dev-chip-sub"${subStyle}>${esc(String(sub))}</div>` : ''}
+    </div>`;
+  };
+
+  // User
   const userDisplay = id.upn || id.email || s['User Email']
     || (id.username && id.domain ? `${id.username}@${id.domain}` : null)
     || id.username || null;
 
-  if (s['Hostname'])    fields.push(['Host',    s['Hostname']]);
-  if (userDisplay)      fields.push(['User',    userDisplay]);
-  if (s['NS Client Version']) fields.push(['Client', s['NS Client Version']]);
-  if (s['Gateway POP']) fields.push(['Gateway', s['Gateway POP']]);
-  if (s['OS Name'])     fields.push(['OS',      s['OS Name'].replace('Microsoft ','')]);
+  // OS
+  const osName = s['OS Name']?.replace('Microsoft ', '') || null;
+  const osSub  = [osName, s['OS Version']].filter(Boolean).join(' ') || null;
 
-  bar.innerHTML = fields.map(([label, val]) => `
-    <div class="dev-field">
-      <span class="dev-label">${label}</span>
-      <span class="dev-value">${esc(val)}</span>
-    </div>
-  `).join('') +
-  `<div class="dev-field" id="bar-timerange" style="display:none">
-    <span class="dev-label">Log Range</span>
-    <span class="dev-value"></span>
-  </div>` +
-  `<div style="margin-left:auto"></div>`;
+  // Client / R-tag
+  const rTag = parseRTag(s['NS Client Version']) || null;
 
-  const rTag   = parseRTag(s['NS Client Version']);
-  const rangeStr = state.logTimeRange
-    ? ` · ${state.logTimeRange.first.slice(0,10)} ${state.logTimeRange.first.slice(11,16)} → ${state.logTimeRange.last.slice(11,16)}`
-    : '';
-  document.getElementById('header-sub').textContent =
-    s['Hostname'] ? `${s['Hostname']}${rTag ? ' · ' + rTag : ''}${rangeStr}` : 'Loaded';
+  // Tenant
+  const tenantShort = s['Tenant Host']?.replace(/\.goskope\.com$/, '') || null;
+  const tenantSub   = s['Tenant ID'] ? `ID: ${s['Tenant ID']}` : (s['Org Key'] ? `Key: ${s['Org Key']}` : null);
+
+  // Gateway / tunnel
+  const pop          = s['Gateway POP'] || s['Gateway'] || null;
+  const tunnelStatus = s['Tunnel Status'] || null;
+  const isConnected  = tunnelStatus && /connected|up|active/i.test(tunnelStatus) && !/dis/i.test(tunnelStatus);
+  const tunnelColor  = isConnected ? '#3fb950' : (tunnelStatus ? '#f85149' : null);
+
+  // Findings (renderFindings() runs before renderDeviceBar, so _detectedFindings is populated)
+  const found  = _detectedFindings || [];
+  const nHigh  = found.filter(d => d.severity === 'high').length;
+  const nWarn  = found.filter(d => d.severity === 'medium' || d.severity === 'warning').length;
+  const nTotal = found.length;
+  const findVal   = nTotal ? `${nTotal} issue${nTotal > 1 ? 's' : ''}` : 'No issues';
+  const findSub   = nHigh ? `${nHigh} HIGH${nWarn ? ` · ${nWarn} WARN` : ''}` : nWarn ? `${nWarn} WARN` : 'All clear';
+  const findColor = nHigh ? '#f85149' : nWarn ? '#d29922' : '#3fb950';
+
+  // Log range
+  const ltr     = state.logTimeRange;
+  const logRange = ltr ? `${ltr.first.slice(5,10)} → ${ltr.last.slice(5,10)}` : null;
+  const logFiles = Object.keys(state.parsedLogs).length;
+  const logLines = Object.values(state.parsedLogs).reduce((acc, r) => acc + r.length, 0);
+  const logSub   = logFiles ? `${logFiles} file${logFiles !== 1 ? 's' : ''} · ${logLines.toLocaleString()} lines` : null;
+
+  bar.innerHTML = [
+    chip('HOST',      s['Hostname'],        osSub),
+    chip('USER',      userDisplay,          s['Tenant Host'] || null),
+    chip('CLIENT',    s['NS Client Version'], rTag),
+    chip('TENANT',    tenantShort,          tenantSub),
+    chip('GATEWAY',   pop,                  tunnelStatus, { subColor: tunnelColor }),
+    chip('STEERING',  s['Steering Config'], s['Traffic Mode'] || null),
+    chip('FINDINGS',  findVal,              findSub, { clickable: true, onclick: "setActiveTab('findings')", valueColor: findColor }),
+    logRange ? chip('LOG RANGE', logRange, logSub, { clickable: true, onclick: "setActiveTab('logs')" }) : '',
+  ].join('');
 
   bar.style.display = 'flex';
+
+  // Header-sub stays for window title context
+  const rangeStr = ltr ? ` · ${ltr.first.slice(0,10)} ${ltr.first.slice(11,16)} → ${ltr.last.slice(11,16)}` : '';
+  document.getElementById('header-sub').textContent =
+    s['Hostname'] ? `${s['Hostname']}${rTag ? ' · '+rTag : ''}${rangeStr}` : 'Loaded';
 }
 
 function renderDashboard() {
