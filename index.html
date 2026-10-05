@@ -338,6 +338,18 @@ body {
 }
 .fl-fbtn:hover { color: var(--text); border-color: var(--text2,var(--muted)); }
 .fl-fbtn.active { background: rgba(88,166,255,0.12); color: var(--primary); border-color: var(--primary); }
+.fl-gi {
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+.fl-gi:hover { background: var(--bg2); }
+.fl-gi.sel {
+  background: rgba(88,166,255,0.1);
+  border-left: 3px solid var(--primary);
+  padding-left: 9px;
+}
 .fp-mode-btn {
   display: flex;
   flex-direction: column;
@@ -1255,7 +1267,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.28.2';
+const TOOL_VERSION = '1.28.3';
 
 // Parse Netskope R-release tag from version string (e.g. '100.2.3.1410' → 'R141')
 function parseRTag(ver) {
