@@ -940,7 +940,7 @@ body {
 
 <script>
 // ─── Version ─────────────────────────────────────────────────────────────────
-const TOOL_VERSION = '1.10.1-beta';
+const TOOL_VERSION = '1.10.2-beta';
 
 // ─── State ────────────────────────────────────────────────────────────────────
 const state = {
@@ -2685,7 +2685,7 @@ function renderFindings() {
   for (const d of detected) byCategory[d.category] = (byCategory[d.category] || 0) + 1;
   const chips = Object.entries(byCategory).map(([cat, n]) => {
     const c = CATEGORIES[cat] || { label: cat, color: '#8b949e' };
-    return `<button class="fl-fbtn" onclick="findingsFilterCat('${cat}',this)"
+    return `<button class="fl-fbtn" data-f="${cat}" onclick="findingsFilterCat('${cat}',this)"
       style="background:${c.color}18;color:${c.color};border-color:${c.color}44">${c.label} ${n}</button>`;
   }).join('');
 
@@ -4432,6 +4432,9 @@ function paintRows() {
 }
 
 // ─── Timeline ─────────────────────────────────────────────────────────────────
+const tlState = { density: true, zoom: null, _bd: null };
+let _tlBrush  = { down: false, startX: 0, dragging: false, justZoomed: false };
+
 function renderTimeline() {
   const el = document.getElementById('timeline-content');
   if (!el) return;
@@ -4441,182 +4444,230 @@ function renderTimeline() {
   }
 
   const allRows = [];
-  for (const [fname, rows] of Object.entries(state.parsedLogs)) {
-    for (const r of rows) {
-      const ms = _tsToMs(r.ts);
-      if (ms) allRows.push({ ms, level: r.level, ts: r.ts || '', msg: r.msg || r.line || '', fname });
-    }
-  }
+  for (const [, rows] of Object.entries(state.parsedLogs))
+    for (const r of rows) { const ms = _tsToMs(r.ts); if (ms) allRows.push({ ms, level: r.level, ts: r.ts }); }
   if (allRows.length < 2) {
     el.innerHTML = '<div style="text-align:center;padding:60px;color:var(--muted);font-size:13px">Not enough timestamped log data.</div>';
     return;
   }
 
-  let minMs = Infinity, maxMs = -Infinity;
-  for (const r of allRows) { if (r.ms < minMs) minMs = r.ms; if (r.ms > maxMs) maxMs = r.ms; }
-  const span = maxMs - minMs || 1;
+  // Full data range (never shrinks with zoom)
+  let globalMin = Infinity, globalMax = -Infinity;
+  for (const r of allRows) { if (r.ms < globalMin) globalMin = r.ms; if (r.ms > globalMax) globalMax = r.ms; }
 
-  const W = 900, ML = 10, MR = 10;
+  const zoom = tlState.zoom;
+  const minMs = zoom ? zoom.startMs : globalMin;
+  const maxMs = zoom ? zoom.endMs   : globalMax;
+  const span  = maxMs - minMs || 1;
+  const rowsInView = zoom ? allRows.filter(r => r.ms >= minMs && r.ms <= maxMs) : allRows;
+
+  // Smart bucket sizing
+  const spanMin = span / 60000;
+  const bucketMin = spanMin <= 5 ? 0.25 : spanMin <= 15 ? 0.5 : spanMin <= 30 ? 1
+    : spanMin <= 120 ? 5 : spanMin <= 480 ? 15 : spanMin <= 1440 ? 60 : 240;
+  const bucketMs   = bucketMin * 60000;
+  const startMs    = Math.floor(minMs / bucketMs) * bucketMs;
+  const numBuckets = Math.min(200, Math.max(2, Math.ceil((maxMs - startMs) / bucketMs) + 1));
+
+  const buckets = Array.from({ length: numBuckets }, (_, i) => ({ ms: startMs + i * bucketMs, e:0, w:0, i:0, d:0 }));
+  for (const r of rowsInView) {
+    const idx = Math.min(numBuckets - 1, Math.floor((r.ms - startMs) / bucketMs));
+    if (idx < 0) continue;
+    const b = buckets[idx], lv = r.level || 'info';
+    if      (lv === 'error')                    b.e++;
+    else if (lv === 'warn' || lv === 'warning') b.w++;
+    else if (lv === 'debug' || lv === 'trace')  b.d++;
+    else                                        b.i++;
+  }
+
+  let maxV = 1;
+  for (const b of buckets) { const s = b.e+b.w+b.i+b.d; if (s > maxV) maxV = s; }
+
+  // Layout
+  const W = 900, ML = 6, MR = 6, MT = 44, MB = 20, H_CHART = 180;
+  const CHART_BASE = MT + H_CHART, TOTAL_H = CHART_BASE + MB + 16;
   const chartW = W - ML - MR;
 
-  const TICK_INTERVALS = [1000,2000,5000,10000,15000,30000,60000,120000,300000,600000,900000,1800000,3600000,7200000,10800000,21600000,43200000,86400000,172800000,604800000];
-  const rawInterval = span / Math.round(chartW / 90);
-  const tickInterval = TICK_INTERVALS.reduce((a, b) => Math.abs(b - rawInterval) < Math.abs(a - rawInterval) ? b : a);
-  const firstTick = Math.ceil(minMs / tickInterval) * tickInterval;
+  const bW  = chartW / numBuckets;
+  const barW = Math.max(1, bW - (bW > 4 ? 0.8 : 0));
+  const tickEvery = Math.max(1, Math.round(numBuckets / 10));
 
-  const fmtTick = ms => {
+  const fmtLabel = ms => {
     const d = new Date(ms);
-    const h = d.getUTCHours().toString().padStart(2, '0');
-    const m = d.getUTCMinutes().toString().padStart(2, '0');
-    return span > 86400000 ? `${d.getUTCMonth()+1}/${d.getUTCDate()} ${h}:${m}` : `${h}:${m}`;
+    const h = d.getUTCHours().toString().padStart(2,'0');
+    const m = d.getUTCMinutes().toString().padStart(2,'0');
+    if (bucketMin >= 1440) return `${d.getUTCMonth()+1}/${d.getUTCDate()}`;
+    if (bucketMin >= 60)   return `${h}:00`;
+    if (bucketMin < 1)     return `${h}:${m}`;
+    return `${h}:${m}`;
   };
 
-  const ticks = [];
-  for (let t = firstTick; t <= maxMs; t += tickInterval) ticks.push({ x: ML + (t - minMs) / span * chartW, label: fmtTick(t) });
+  // Store for brush handlers
+  tlState._bd = { buckets, bucketMs, numBuckets, startMs, w: W, ml: ML, mr: MR, mt: MT, hChart: H_CHART };
 
-  function mkAxis(axisY, lm) {
-    const cW = W - lm - MR;
-    return `<line x1="${lm}" y1="${axisY}" x2="${W-MR}" y2="${axisY}" stroke="var(--border)" stroke-width="1"/>` +
-      ticks.map(t => {
-        const x = (lm + (t.x - ML) / chartW * cW).toFixed(1);
-        return `<line x1="${x}" y1="${axisY}" x2="${x}" y2="${axisY+4}" stroke="var(--muted)" stroke-width="1"/>
-          <text x="${x}" y="${axisY+14}" font-size="8" text-anchor="middle" fill="var(--muted)">${esc(t.label)}</text>`;
-      }).join('');
-  }
+  // 50% reference line — subtle guide for eyeballing relative height
+  const refY = (CHART_BASE - H_CHART * 0.5).toFixed(1);
 
-  // ── Section 1: Connection Lifecycle ───────────────────────────────────────
-  const CATS = [
-    { key: 'conn', color: '#3fb950', label: 'Connected',    re: /connect(?:ed|ing)\b|tunnel.{0,8}(?:up|establ|ready)|gateway.{0,8}(?:up|connect)/i },
-    { key: 'disc', color: '#f85149', label: 'Disconnected', re: /disconnect(?:ed|ing)?\b|tunnel.{0,8}(?:down|clos|drop)|gateway.{0,8}(?:lost|down|fail)/i },
-    { key: 'auth', color: '#e3b341', label: 'Auth',         re: /\bauth(?:entication|enticated|orizing|orized)?\b|token.{0,8}refresh|\bsaml\b|\bidp\b/i },
-    { key: 'npa',  color: '#58a6ff', label: 'NPA',          re: /npa.{0,8}tunnel|private.{0,5}app|publisher.{0,5}connect|broker.{0,8}connect/i },
-  ];
-
-  const events = [];
-  for (const r of allRows) {
-    for (const cat of CATS) {
-      if (cat.re.test(r.msg)) { events.push({ ms: r.ms, cat, ts: r.ts, fname: r.fname }); break; }
+  // Bars — stacked d/i/w/e bottom→top
+  const C = { e:'#f85149', w:'#d29922', i:'#1f6feb', d:'#3d444d' };
+  const bars = buckets.map((b, idx) => {
+    const x = (ML + idx * bW).toFixed(1);
+    const total = b.e + b.w + b.i + b.d;
+    let rects = '', cumH = 0;
+    if (total > 0) {
+      for (const [k, fill] of [['d',C.d],['i',C.i],['w',C.w],['e',C.e]]) {
+        const v = b[k]; if (!v) continue;
+        const h = tlState.density ? (v / maxV) * H_CHART : (v / total) * H_CHART;
+        const ry = (CHART_BASE - cumH - h).toFixed(1);
+        cumH += h;
+        rects += `<rect x="${x}" y="${ry}" width="${barW.toFixed(1)}" height="${Math.max(h,.5).toFixed(1)}" fill="${fill}" opacity="0.88"/>`;
+      }
     }
-  }
-
-  const S_MT = 38, S_H = 38, S_MB = 20, R = 3, ROW_H = R * 2 + 3;
-  const placed = [];
-  const dotsSvg = events.map(ev => {
-    const x = ML + (ev.ms - minMs) / span * chartW;
-    let row = 0;
-    while (placed.some(p => Math.abs(p.x - x) < R * 3 && p.row === row)) row++;
-    const y = S_MT + S_H - R - row * ROW_H;
-    if (y < S_MT + R) return '';
-    placed.push({ x, row });
-    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${R}" fill="${ev.cat.color}" opacity="0.85" style="cursor:pointer"
-      data-label="${esc(ev.cat.label)}" data-ts="${esc(ev.ts)}" data-fname="${esc(ev.fname)}" data-ms="${ev.ms}"
-      onmouseover="tlEvTip(event,this)" onmouseout="tlHide()" onclick="tlEvJump(${ev.ms})"/>`;
+    return `<g data-idx="${idx}" style="cursor:pointer" onmouseover="tlShow(event,this)" onmouseout="tlHide()" onclick="tlJump(this)">
+      <rect x="${x}" y="${MT}" width="${barW.toFixed(1)}" height="${H_CHART}" fill="transparent"/>
+      ${rects}</g>`;
   }).join('');
 
-  const legendSvg = CATS.map((c, i) => {
-    const lx = ML + i * 115;
-    return `<circle cx="${lx+4}" cy="${S_MT-17}" r="4" fill="${c.color}"/>
-      <text x="${lx+12}" y="${S_MT-13}" font-size="9" fill="var(--muted)">${c.label}</text>`;
-  }).join('');
+  // X-axis + ticks
+  const xAxis = `<line x1="${ML}" y1="${CHART_BASE}" x2="${W-MR}" y2="${CHART_BASE}" stroke="var(--border)" stroke-width="1"/>` +
+    buckets.map((b, i) => {
+      if (i % tickEvery !== 0) return '';
+      const x = (ML + (i + 0.5) * bW).toFixed(1);
+      return `<line x1="${x}" y1="${CHART_BASE}" x2="${x}" y2="${CHART_BASE+3}" stroke="var(--muted)" stroke-width="1"/>
+        <text x="${x}" y="${CHART_BASE+13}" font-size="8" text-anchor="middle" fill="var(--muted)">${fmtLabel(b.ms)}</text>`;
+    }).join('');
 
-  const lifecycleSvg = `<svg viewBox="0 0 ${W} ${S_MT+S_H+S_MB}" xmlns="http://www.w3.org/2000/svg"
-    style="width:100%;height:auto;display:block;font-family:var(--font-mono,monospace)">
-    <text x="${ML}" y="${S_MT-28}" font-size="10" font-weight="600" fill="var(--text)">Connection Lifecycle</text>
-    ${legendSvg}${dotsSvg}${mkAxis(S_MT+S_H, ML)}
+  const legend = [['e','#f85149','Errors'],['w','#d29922','Warnings'],['i','#1f6feb','Info'],['d','#3d444d','Debug']]
+    .map(([,c,lbl], i) => `<rect x="${ML+i*88}" y="${MT-14}" width="8" height="8" fill="${c}" rx="1"/>
+      <text x="${ML+i*88+12}" y="${MT-6}" font-size="9" fill="var(--muted)">${lbl}</text>`).join('');
+
+  const hint = zoom
+    ? `<text x="${W-MR}" y="${MT-6}" font-size="9" text-anchor="end" fill="#58a6ff">zoomed · dbl-click to reset</text>`
+    : `<text x="${W-MR}" y="${MT-6}" font-size="9" text-anchor="end" fill="var(--muted)">drag to zoom · click bar → Log Viewer</text>`;
+
+  const svg = `<svg id="tl-svg" viewBox="0 0 ${W} ${TOTAL_H}" xmlns="http://www.w3.org/2000/svg"
+    style="width:100%;height:auto;display:block;font-family:var(--font-mono,monospace);user-select:none;cursor:crosshair"
+    onmousedown="tlBrushDown(event)" onmousemove="tlBrushMove(event)"
+    onmouseup="tlBrushUp(event)" onmouseleave="tlBrushCancel()" ondblclick="tlResetZoom()">
+    <line x1="${ML}" y1="${refY}" x2="${W-MR}" y2="${refY}" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="3,3" opacity="0.4"/>
+    <line x1="${ML}" y1="${MT}" x2="${ML}" y2="${CHART_BASE}" stroke="var(--border)" stroke-width="1"/>
+    ${bars}${xAxis}${legend}${hint}
+    <rect id="tl-bsel" x="${ML}" y="${MT}" width="0" height="${H_CHART}"
+      fill="rgba(88,166,255,.10)" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="4,3"
+      pointer-events="none" display="none"/>
   </svg>`;
 
-  // ── Section 2: Cross-file Correlation ────────────────────────────────────
-  const LW = 92, NBUCKETS = 60, SW_H = 26, SW_GAP = 4, SW_MT = 38, SW_MB = 18;
-  const cSW = W - LW - MR;
-
-  const sources = [
-    { label: 'nsdebuglog',  rows: allRows.filter(r => /nsdebuglog/i.test(r.fname)) },
-    { label: 'npadebuglog', rows: allRows.filter(r => /npadebuglog/i.test(r.fname)) },
-  ].filter(s => s.rows.length > 0);
-
-  let swimSvg = `<text x="${LW}" y="${SW_MT-28}" font-size="10" font-weight="600" fill="var(--text)">Log File Correlation</text>
-    <text x="${LW}" y="${SW_MT-14}" font-size="9" fill="var(--muted)">errors + warnings per source — shared time axis</text>`;
-
-  if (sources.length < 2) {
-    swimSvg += `<text x="${W/2}" y="${SW_MT+40}" font-size="10" text-anchor="middle" fill="var(--muted)">Load both nsdebuglog and npadebuglog to see cross-file correlation.</text>`;
-  } else {
-    sources.forEach((src, si) => {
-      const B = Array.from({length: NBUCKETS}, () => ({e:0,w:0}));
-      for (const r of src.rows) {
-        const bi = Math.min(NBUCKETS-1, Math.floor((r.ms - minMs) / span * NBUCKETS));
-        const lv = r.level || '';
-        if (lv === 'error') B[bi].e++;
-        else if (lv === 'warn' || lv === 'warning') B[bi].w++;
-      }
-      const maxCnt = Math.max(1, ...B.map(b => b.e + b.w));
-      const y0 = SW_MT + si * (SW_H + SW_GAP);
-      const bw = cSW / NBUCKETS;
-
-      swimSvg += `<rect x="${LW}" y="${y0}" width="${cSW}" height="${SW_H}" fill="var(--bg0)" rx="2"/>`;
-      swimSvg += `<text x="${LW-5}" y="${(y0+SW_H/2+4).toFixed(1)}" font-size="8" text-anchor="end" fill="var(--muted)">${src.label}</text>`;
-
-      for (let i = 0; i < NBUCKETS; i++) {
-        const b = B[i]; const x = LW + i * bw; let y = y0 + SW_H;
-        const bar = (cnt, fill) => {
-          if (!cnt) return;
-          const bh = Math.max(1.5, SW_H * cnt / maxCnt); y -= bh;
-          swimSvg += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(1, bw-0.5).toFixed(1)}" height="${bh.toFixed(1)}" fill="${fill}" opacity="0.9"/>`;
-        };
-        bar(b.w, '#e3b341'); bar(b.e, '#f85149');
-      }
-    });
-    swimSvg += mkAxis(SW_MT + sources.length * (SW_H + SW_GAP), LW);
-  }
-
-  const SWIM_TOTAL = SW_MT + sources.length * (SW_H + SW_GAP) + SW_MB;
-  const correlationSvg = `<svg viewBox="0 0 ${W} ${SWIM_TOTAL}" xmlns="http://www.w3.org/2000/svg"
-    style="width:100%;height:auto;display:block;font-family:var(--font-mono,monospace)">${swimSvg}</svg>`;
+  // Severity totals (always full dataset, not zoomed)
+  const tE = allRows.filter(r => r.level==='error').length;
+  const tW = allRows.filter(r => r.level==='warn'||r.level==='warning').length;
+  const tD = allRows.filter(r => r.level==='debug'||r.level==='trace').length;
+  const tI = allRows.length - tE - tW - tD;
 
   el.innerHTML = `
-    <div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:12px;overflow-x:auto">
-      ${lifecycleSvg}
-      ${events.length === 0 ? `<div style="color:var(--muted);font-size:11px;padding:2px 0 0">No connection lifecycle events detected.</div>` : ''}
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <span style="font-size:11px;font-weight:600;color:var(--text)">Log Activity — All Files</span>
+      <span style="flex:1"></span>
+      <span style="font-size:10px;color:var(--muted)">${bucketMin<1?`${bucketMin*60}s`:bucketMin>=60?`${bucketMin/60}h`:`${bucketMin}m`}/bar · ${numBuckets} bars${zoom?' · <strong style="color:#58a6ff">zoomed</strong>':''}</span>
+      <button class="filter-btn" onclick="tlState.density=!tlState.density;renderTimeline()"
+        style="font-size:10px;${tlState.density?'background:var(--bg3);color:var(--text);border-color:var(--primary)':''}">
+        ${tlState.density ? '▲ Density' : '% Mix'}</button>
+      ${zoom?`<button class="filter-btn" onclick="tlResetZoom()" style="font-size:10px;background:rgba(88,166,255,.12);color:#58a6ff;border-color:#58a6ff">↩ Reset</button>`:''}
     </div>
-    <div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:12px 14px;overflow-x:auto">
-      ${correlationSvg}
+    <div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:10px 12px;overflow-x:auto">${svg}</div>
+    <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
+      ${[['#f85149','Errors',tE],['#d29922','Warnings',tW],['#1f6feb','Info',tI],['#3d444d','Debug',tD]].map(([c,lbl,n])=>
+        `<div style="flex:1;min-width:90px;background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:8px 12px">
+          <div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em">${lbl}</div>
+          <div style="font-size:18px;font-weight:700;color:${c};line-height:1.2">${n.toLocaleString()}</div>
+        </div>`).join('')}
     </div>
-    <div style="margin-top:8px;font-size:10px;color:var(--muted);text-align:right">
-      ${events.length.toLocaleString()} lifecycle events · ${allRows.length.toLocaleString()} total rows · click a dot to jump to Log Viewer
-    </div>
-    <div id="tl-tooltip" style="display:none;position:fixed;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:11px;color:var(--text);pointer-events:none;z-index:9999;min-width:160px"></div>`;
+    <div id="tl-tooltip" style="display:none;position:fixed;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:7px 11px;font-size:11px;color:var(--text);pointer-events:none;z-index:9999;min-width:150px;line-height:1.5"></div>`;
 }
 
-function tlEvTip(event, el) {
-  const tip = document.getElementById('tl-tooltip');
-  if (!tip) return;
-  const d = el.dataset;
-  tip.innerHTML = `<div style="font-weight:600;margin-bottom:3px;color:${esc(el.getAttribute('fill'))}">${esc(d.label)}</div>
-    <div style="opacity:.7;font-size:10px">${esc(d.ts)}</div>
-    <div style="opacity:.55;font-size:10px">${esc(d.fname)}</div>`;
-  tip.style.display = 'block';
-  tip.style.left = (event.clientX + 14) + 'px';
-  tip.style.top  = (event.clientY - 10) + 'px';
-}
+function tlResetZoom() { tlState.zoom = null; renderTimeline(); }
 
-function tlEvJump(ms) {
+function tlSvgX(e) {
+  const svg = document.getElementById('tl-svg'); if (!svg) return 0;
+  const r = svg.getBoundingClientRect();
+  return (e.clientX - r.left) * ((tlState._bd?.w || 900) / r.width);
+}
+function tlBrushDown(e) {
+  const x = tlSvgX(e), bd = tlState._bd;
+  if (!bd || x < bd.ml || x > bd.w - bd.mr) return;
+  _tlBrush = { down: true, startX: x, dragging: false, justZoomed: false };
+}
+function tlBrushMove(e) {
+  if (!_tlBrush.down) return;
+  const bd = tlState._bd; if (!bd) return;
+  const x = Math.max(bd.ml, Math.min(bd.w - bd.mr, tlSvgX(e)));
+  if (Math.abs(x - _tlBrush.startX) > 5) {
+    _tlBrush.dragging = true; tlHide();
+    const bsel = document.getElementById('tl-bsel');
+    if (bsel) {
+      const x1 = Math.min(_tlBrush.startX, x), x2 = Math.max(_tlBrush.startX, x);
+      bsel.setAttribute('x', x1.toFixed(1)); bsel.setAttribute('width', (x2-x1).toFixed(1));
+      bsel.removeAttribute('display');
+    }
+  }
+}
+function tlBrushUp(e) {
+  if (!_tlBrush.down) return;
+  const endX = tlSvgX(e), startX = _tlBrush.startX, wasDrag = _tlBrush.dragging;
+  _tlBrush = { down: false, startX: 0, dragging: false, justZoomed: false };
+  const bsel = document.getElementById('tl-bsel');
+  if (bsel) bsel.setAttribute('display', 'none');
+  if (!wasDrag) return;
+  const bd = tlState._bd; if (!bd) return;
+  const { buckets, bucketMs, w, ml, mr } = bd;
+  const cW = w - ml - mr;
+  const x1 = Math.max(ml, Math.min(startX, endX)), x2 = Math.min(w-mr, Math.max(startX, endX));
+  const i0 = Math.max(0, Math.floor((x1-ml)/cW*buckets.length));
+  const i1 = Math.min(buckets.length-1, Math.floor((x2-ml)/cW*buckets.length));
+  if (i1 <= i0) return;
+  tlState.zoom = { startMs: buckets[i0].ms, endMs: buckets[i1].ms + bucketMs };
+  _tlBrush.justZoomed = true;
+  renderTimeline();
+}
+function tlBrushCancel() {
+  if (!_tlBrush.down) return;
+  _tlBrush = { down: false, startX: 0, dragging: false, justZoomed: false };
+  const bsel = document.getElementById('tl-bsel');
+  if (bsel) bsel.setAttribute('display', 'none');
+}
+function tlShow(e, g) {
+  if (_tlBrush.dragging) return;
+  const tip = document.getElementById('tl-tooltip'); if (!tip) return;
+  const bd = tlState._bd, idx = parseInt(g.dataset.idx);
+  if (!bd || isNaN(idx)) return;
+  const b = bd.buckets[idx], total = b.e+b.w+b.i+b.d;
+  const p = n => String(n).padStart(2,'0');
+  const fmt = ms => { const d = new Date(ms); return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`; };
+  const rows = [
+    b.e?`<div><span style="color:#f85149">▪</span> Error <strong style="float:right;padding-left:12px">${b.e.toLocaleString()}</strong></div>`:'',
+    b.w?`<div><span style="color:#d29922">▪</span> Warn <strong style="float:right;padding-left:12px">${b.w.toLocaleString()}</strong></div>`:'',
+    b.i?`<div><span style="color:#1f6feb">▪</span> Info <strong style="float:right;padding-left:12px">${b.i.toLocaleString()}</strong></div>`:'',
+    b.d?`<div><span style="color:#3d444d">▪</span> Debug <strong style="float:right;padding-left:12px">${b.d.toLocaleString()}</strong></div>`:'',
+  ].join('');
+  tip.innerHTML = `<div style="font-size:10px;color:var(--muted);margin-bottom:4px;padding-bottom:3px;border-bottom:1px solid var(--border)">${fmt(b.ms)} – ${fmt(b.ms+bd.bucketMs)}</div>
+    ${rows||'<span style="opacity:.4">No data</span>'}
+    ${total?`<div style="margin-top:3px;padding-top:3px;border-top:1px solid var(--border);font-size:10px;opacity:.6">Total: ${total.toLocaleString()}</div>`:''}`;
+  tip.style.display = 'block'; tip.style.left = (e.clientX+14)+'px'; tip.style.top = (e.clientY-10)+'px';
+}
+function tlJump(g) {
+  if (_tlBrush.justZoomed) { _tlBrush.justZoomed = false; return; }
   tlHide();
-  const d = new Date(ms);
-  const pad = n => n.toString().padStart(2, '0');
-  const Y = d.getUTCFullYear(), M = pad(d.getUTCMonth()+1), D = pad(d.getUTCDate());
-  const H = pad(d.getUTCHours()), Min = pad(d.getUTCMinutes()), S = pad(d.getUTCSeconds());
-  const pattern = `${Y}[-/]${M}[-/]${D} ${H}:${Min}:${S}`;
-  const inp = document.getElementById('log-search');
-  if (inp) inp.value = pattern;
-  state.logRegexMode = true;
-  state.logCompiledRe = new RegExp(pattern);
-  state.searchQuery   = pattern;
+  const bd = tlState._bd, idx = parseInt(g.dataset.idx);
+  if (!bd || isNaN(idx)) return;
+  const d = new Date(bd.buckets[idx].ms);
+  const p = n => n.toString().padStart(2,'0');
+  const pattern = `${d.getUTCFullYear()}[-/]${p(d.getUTCMonth()+1)}[-/]${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+  const inp = document.getElementById('log-search'); if (inp) inp.value = pattern;
+  state.logRegexMode = true; state.logCompiledRe = new RegExp(pattern); state.searchQuery = pattern;
   document.getElementById('log-regex-btn')?.classList.add('regex-active');
   const allBtn = document.getElementById('log-allfiles-btn');
-  if (!state.globalSearchMode) toggleGlobalSearch(allBtn);
-  else runGlobalSearch();
+  if (!state.globalSearchMode) toggleGlobalSearch(allBtn); else runGlobalSearch();
   setActiveTab('logs');
 }
-
 function tlHide() {
   const tip = document.getElementById('tl-tooltip');
   if (tip) tip.style.display = 'none';
@@ -5405,7 +5456,7 @@ function parseGSLBData(isRetry = false) {
     // macOS also fires updateGSLB:true but Pops fetched begin is cleaner and cross-platform.
     if (msg.includes('Pops fetched begin')) {
       if (cur && cur.rtts.length) rounds.push(cur);
-      cur = { ts: row.ts, egress: null, rtts: [], orderedPops: null, gslbWinner: null, connected: null, tunnel: null, curPop: null };
+      cur = { ts: row.ts, egress: null, rtts: [], orderedPops: null, gslbWinner: null, connected: null, tunnel: null, curPop: null, protocol: null, hasFallback: false };
       // fall through — this same line also carries egress_ip
     }
     if (!cur) continue;
@@ -5419,6 +5470,9 @@ function parseGSLBData(isRetry = false) {
     if ((m = msg.match(RE_GSLB_CURPOP)))  cur.curPop = m[1];
     if ((m = msg.match(RE_GSLB_CONNECT))) cur.connected = m[1];
     if ((m = msg.match(RE_GSLB_TUNNEL)))  cur.tunnel = { gateway: m[1], pop: m[2], assignedIp: m[3] };
+    if (/Fallback to TLS/i.test(msg))                              { cur.protocol = 'TLS';  cur.hasFallback = true; }
+    else if (!cur.protocol && /DTLS.*[Tt]unnel|[Tt]unnel.*DTLS/i.test(msg)) cur.protocol = 'DTLS';
+    else if (!cur.protocol && /TLS client established connection/i.test(msg)) cur.protocol = 'TLS';
   }
   if (cur && cur.rtts.length) rounds.push(cur);
 
@@ -6102,9 +6156,17 @@ function renderGSLB() {
 
   const totalGslbPops = GSLB_POP_DATA.reduce((n, d) => n + d.pops.length, 0);
 
+  // Tunnel protocol summary
+  const dtlsRounds    = rounds.filter(r => r.protocol === 'DTLS').length;
+  const tlsRounds     = rounds.filter(r => r.protocol === 'TLS').length;
+  const fallbackRounds = rounds.filter(r => r.hasFallback).length;
+  const protoLabel    = dtlsRounds > 0 && tlsRounds > 0 ? 'Mixed' : dtlsRounds > 0 ? 'DTLS' : tlsRounds > 0 ? 'TLS' : '—';
+  const protoColor    = protoLabel === 'DTLS' ? 'var(--success)' : protoLabel === 'TLS' ? 'var(--warning)' : protoLabel === 'Mixed' ? '#f85149' : 'var(--muted)';
+  const protoSub      = fallbackRounds > 0 ? `${fallbackRounds} DTLS→TLS fallback${fallbackRounds>1?'s':''}` : dtlsRounds > 0 ? `${dtlsRounds} DTLS session${dtlsRounds>1?'s':''}` : tlsRounds > 0 ? `${tlsRounds} TLS session${tlsRounds>1?'s':''}` : 'no protocol detected';
+
   el.innerHTML = fileBar + `
     <!-- ── Stat cards ── -->
-    <div class="dash-grid" style="margin-bottom:16px;grid-template-columns:repeat(3,1fr)">
+    <div class="dash-grid" style="margin-bottom:16px;grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">
       <div class="stat-card">
         <div class="stat-label">Election Rounds</div>
         <div class="stat-value">${rounds.length}</div>
@@ -6119,6 +6181,11 @@ function renderGSLB() {
         <div class="stat-label">Connected PoP</div>
         <div class="stat-value" style="font-size:18px">${esc(connPop.name)}</div>
         <div class="stat-sub">${connPop.connected}× connected · ${trend || '—'}</div>
+      </div>
+      <div class="stat-card" ${fallbackRounds > 0 ? 'style="border-color:rgba(248,81,73,.4)"' : protoLabel === 'TLS' ? 'style="border-color:rgba(227,179,65,.4)"' : ''}>
+        <div class="stat-label">Tunnel Protocol</div>
+        <div class="stat-value" style="color:${protoColor};font-size:20px">${protoLabel}</div>
+        <div class="stat-sub">${protoSub}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Client Egress IP</div>
@@ -6154,6 +6221,7 @@ function renderGSLB() {
           <th style="text-align:center">Δ% ≥25%</th>
           <th style="text-align:center">Δms ≥20ms</th>
           <th>Action</th>
+          <th>Protocol</th>
           <th style="font-size:10px;color:var(--muted);font-weight:400;white-space:nowrap">View Map</th>
         </tr></thead>
         <tbody>
@@ -6206,6 +6274,13 @@ function renderGSLB() {
               <td style="text-align:center">${propCell}</td>
               <td style="text-align:center">${absCell}</td>
               <td>${actionCell}</td>
+              <td>${r.protocol
+                ? r.hasFallback
+                  ? `<span style="font-size:10px;font-weight:700;color:#f85149">DTLS→TLS</span>`
+                  : r.protocol === 'DTLS'
+                    ? `<span style="font-size:10px;font-weight:700;color:var(--success)">DTLS</span>`
+                    : `<span style="font-size:10px;font-weight:700;color:var(--warning)">TLS</span>`
+                : `<span style="color:var(--muted);font-size:11px">—</span>`}</td>
               <td style="padding:4px 6px"><button onclick="event.stopPropagation();gslbShowMapModal(${i})" title="View PoP map for this round" style="background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;padding:1px 5px;font-size:11px;line-height:1.5">🗺</button></td>
             </tr>`;
           }).join('')}
@@ -6447,14 +6522,17 @@ function renderNPA() {
   // ── Private Apps table ────────────────────────────────────────────────────
   const appsTable = privateApps.length === 0 ? `
     <div style="color:var(--muted);padding:12px;font-size:12px">No private app (SRP) rules detected in this log</div>` : `
-    <div class="error-table" style="margin-bottom:20px">
+    <input id="npa-search" class="search-box" placeholder="🔍 Filter by app, policy, or destination…"
+      oninput="npaSearch(this.value)" style="width:100%;box-sizing:border-box;margin-bottom:8px;font-size:12px">
+    <div class="error-table" id="npa-apps-table" style="margin-bottom:20px">
       <table>
         <thead><tr>
           <th>App Name</th><th>Policy</th><th>Destination</th><th>Port</th><th>Proto</th><th>Action</th><th>Seen</th>
         </tr></thead>
         <tbody>
-          ${privateApps.map(a => `
-            <tr>
+          ${privateApps.map(a => {
+            const searchKey = [a.appName, a.policy, a.destHost, a.destPort].join('\t').toLowerCase();
+            return `<tr data-search="${esc(searchKey)}">
               <td style="font-weight:600;color:var(--primary)">${esc(a.appName)}</td>
               <td style="font-size:11px;color:var(--text)">${esc(a.policy)}</td>
               <td style="font-family:monospace;font-size:11px">${esc(a.destHost)}</td>
@@ -6462,7 +6540,8 @@ function renderNPA() {
               <td><span class="badge badge-blue" style="font-size:10px">${esc(a.proto)}</span></td>
               <td><span class="badge ${a.action === 'forward' ? 'badge-blue' : 'badge-red'}" style="font-size:10px">${esc(a.action)}</span></td>
               <td style="color:var(--muted);font-size:11px">${a.count}×</td>
-            </tr>`).join('')}
+            </tr>`;
+          }).join('')}
         </tbody>
       </table>
     </div>`;
@@ -6508,6 +6587,13 @@ function renderNPA() {
     ${sessTable}`;
 }
 
+
+function npaSearch(q) {
+  const term = q.toLowerCase().trim();
+  document.querySelectorAll('#npa-apps-table tbody tr').forEach(row => {
+    row.style.display = !term || (row.dataset.search || '').includes(term) ? '' : 'none';
+  });
+}
 
 // ─── Chart Helpers ────────────────────────────────────────────────────────────
 function showChartTip(ev, html) {
@@ -7005,7 +7091,7 @@ let flState = {
   groups: [], filteredGroups: [], selectedGroupIdx: 0, selectedNodeId: null,
   panX: 0, panY: 0, scale: 1,
   isDragging: false, startX: 0, startY: 0, startPanX: 0, startPanY: 0,
-  searchQuery: '', showFilter: 'all', animEnabled: true, initialized: false,
+  searchQuery: '', showFilter: 'all', showDest: 'both', animEnabled: true, initialized: false,
   evBindDone: false
 };
 
@@ -7087,11 +7173,16 @@ function flShellHTML() {
       <div style="font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Flow Groups</div>
       <input id="fl-search" class="search-box" placeholder="Search domain or IP…" oninput="flFilterGroups(this.value)"
         style="width:100%;box-sizing:border-box;font-size:11px;margin-bottom:6px">
-      <div style="display:flex;gap:3px;flex-wrap:wrap">
-        <button class="fl-fbtn active" data-f="all"      onclick="flSetFilter('all',this)">All</button>
-        <button class="fl-fbtn"        data-f="steered"  onclick="flSetFilter('steered',this)">Steered</button>
-        <button class="fl-fbtn"        data-f="bypassed" onclick="flSetFilter('bypassed',this)">Bypassed</button>
-        <button class="fl-fbtn"        data-f="mixed"    onclick="flSetFilter('mixed',this)">Mixed</button>
+      <div id="fl-filter-traffic" style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:3px">
+        <button class="fl-fbtn active" data-g="traffic" data-f="all"      onclick="flSetFilter('all',this)">All</button>
+        <button class="fl-fbtn"        data-g="traffic" data-f="steered"  onclick="flSetFilter('steered',this)">Steered</button>
+        <button class="fl-fbtn"        data-g="traffic" data-f="bypassed" onclick="flSetFilter('bypassed',this)">Bypassed</button>
+        <button class="fl-fbtn"        data-g="traffic" data-f="mixed"    onclick="flSetFilter('mixed',this)">Mixed</button>
+      </div>
+      <div id="fl-filter-dest" style="display:flex;gap:3px;flex-wrap:wrap">
+        <button class="fl-fbtn active" data-g="dest" data-f="both"    onclick="flSetDest('both',this)">Both</button>
+        <button class="fl-fbtn"        data-g="dest" data-f="domain"  onclick="flSetDest('domain',this)">Domain</button>
+        <button class="fl-fbtn"        data-g="dest" data-f="process" onclick="flSetDest('process',this)">Process</button>
       </div>
     </div>
     <div id="fl-group-list" style="flex:1;overflow-y:auto"></div>
@@ -7169,16 +7260,28 @@ function flFilterGroups(q) {
 }
 function flSetFilter(f, btn) {
   flState.showFilter = f;
-  document.querySelectorAll('.fl-fbtn').forEach(b => b.classList.toggle('active', b.dataset.f === f));
+  document.querySelectorAll('#fl-filter-traffic .fl-fbtn').forEach(b => b.classList.toggle('active', b.dataset.f === f));
+  flApplyFilters();
+}
+function flSetDest(d, btn) {
+  flState.showDest = d;
+  document.querySelectorAll('#fl-filter-dest .fl-fbtn').forEach(b => b.classList.toggle('active', b.dataset.f === d));
   flApplyFilters();
 }
 function flApplyFilters() {
-  const { groups, searchQuery, showFilter } = flState;
+  const { groups, searchQuery, showFilter, showDest } = flState;
+  const isIP = d => /^\d{1,3}(\.\d{1,3}){3}$/.test(d);
   flState.filteredGroups = groups.filter(g => {
-    if (searchQuery && !g.domain.includes(searchQuery)) return false;
     if (showFilter === 'steered'  && g.steered === 0) return false;
     if (showFilter === 'bypassed' && g.bypassed === 0) return false;
     if (showFilter === 'mixed'    && (g.steered === 0 || g.bypassed === 0)) return false;
+    if (showDest === 'domain'  && isIP(g.domain)) return false;
+    if (showDest === 'process' && Object.keys(g.procMap).length === 0) return false;
+    if (searchQuery) {
+      const domainMatch = g.domain.includes(searchQuery);
+      const procMatch   = Object.keys(g.procMap).some(p => p.toLowerCase().includes(searchQuery));
+      if (!domainMatch && !procMatch) return false;
+    }
     return true;
   });
   flRenderGroupList();
@@ -7187,27 +7290,39 @@ function flApplyFilters() {
 }
 
 function flRenderGroupList() {
-  const { filteredGroups, selectedGroupIdx } = flState;
+  const { filteredGroups, selectedGroupIdx, showDest } = flState;
   const el = document.getElementById('fl-group-list');
   if (!el) return;
+  const procMode = showDest === 'process';
   el.innerHTML = filteredGroups.map((g, i) => {
-    const total = g.steered + g.bypassed;
     const isMixed = g.steered > 0 && g.bypassed > 0;
     const c = isMixed ? '#58a6ff' : g.bypassed > 0 ? '#d29922' : '#3fb950';
     const sym = isMixed ? '◈' : g.bypassed > 0 ? '⚠' : '✓';
-    const procCount = Object.keys(g.procMap).length;
+    const procNames = Object.keys(g.procMap);
+    const procCount = procNames.length;
     const hostCount = Object.keys(g.hosts).length;
+    let primaryLabel, primaryTitle, subLine;
+    if (procMode && procCount > 0) {
+      const shown = procNames.slice(0, 2).map(p => esc(p)).join(', ');
+      primaryLabel = shown + (procCount > 2 ? ` <span style="opacity:.5">+${procCount-2}</span>` : '');
+      primaryTitle = procNames.join(', ');
+      subLine = `<span title="${esc(g.domain)}">${esc(g.domain)}</span><span>·</span>
+        <span style="color:#3fb950">${g.steered}▲</span>
+        <span style="color:${g.bypassed>0?'#d29922':'var(--muted)'}">${g.bypassed}⚠</span>`;
+    } else {
+      primaryLabel = esc(g.domain);
+      primaryTitle = g.domain;
+      subLine = `<span>${procCount} app${procCount!==1?'s':''}</span><span>·</span>
+        <span>${hostCount} host${hostCount!==1?'s':''}</span><span>·</span>
+        <span style="color:#3fb950">${g.steered}▲</span>
+        <span style="color:${g.bypassed>0?'#d29922':'var(--muted)'}">${g.bypassed}⚠</span>`;
+    }
     return `<div class="fl-gi ${i===selectedGroupIdx?'sel':''}" onclick="flSelectGroup(${i})">
       <div style="display:flex;align-items:center;gap:5px;margin-bottom:2px">
         <span style="color:${c};font-size:11px;flex-shrink:0">${sym}</span>
-        <span style="font-size:11px;font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(g.domain)}">${esc(g.domain)}</span>
+        <span style="font-size:11px;font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${primaryTitle}">${primaryLabel}</span>
       </div>
-      <div style="font-size:10px;color:var(--muted);display:flex;gap:6px">
-        <span>${procCount} app${procCount!==1?'s':''}</span><span>·</span>
-        <span>${hostCount} host${hostCount!==1?'s':''}</span><span>·</span>
-        <span style="color:#3fb950">${g.steered}▲</span>
-        <span style="color:${g.bypassed>0?'#d29922':'var(--muted)'}">${g.bypassed}⚠</span>
-      </div>
+      <div style="font-size:10px;color:var(--muted);display:flex;gap:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${subLine}</div>
     </div>`;
   }).join('');
 }
