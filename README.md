@@ -25,11 +25,11 @@ A pinned header that persists across all tabs, showing the most important contex
 | HOST | Device hostname and OS version |
 | USER | Authenticated user and tenant |
 | CLIENT | Netskope Client version and release tag |
-| TENANT | Tenant hostname |
+| TENANT | Tenant name (shortened) and Tenant ID or Org Key |
 | GATEWAY | Active PoP and tunnel status |
 | STEERING | Steering configuration and traffic mode |
 | FINDINGS | Count and severity of detected issues |
-| LOG RANGE | Time span covered by the loaded logs |
+| LOG RANGE | Date range of loaded logs, plus file count and line count |
 
 ### Tabs
 
