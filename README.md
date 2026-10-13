@@ -6,12 +6,12 @@ A zero-dependency, single-file HTML diagnostic tool for analyzing Netskope Clien
 
 ## Quick Start
 
-1. Download `netskope_log_analyzer_v1.23.2.html` (stable) or `index.html` (latest beta) from this repo.
-2. Open the file in any modern browser (Chrome, Edge, Firefox, Safari).
-3. Drop a Netskope Client log ZIP onto the drop zone.
-4. Review findings, explore logs, and export a diagnostic report.
+1. Go to the **[`main` branch](../../tree/main)** for the stable release, or **[`beta`](../../tree/beta)** for the latest development version.
+2. Download **`index.html`** from whichever branch you want.
+3. Open it in any modern browser (Chrome, Edge, Firefox, Safari).
+4. Drop a Netskope Client log ZIP onto the drop zone.
 
-No account, no login, no internet connection required after download.
+`index.html` is always the current version of that branch. Prior releases are archived in the [`releases/`](releases/) folder.
 
 ---
 
@@ -57,18 +57,18 @@ A pinned header that persists across all tabs, showing the most important contex
 - Evidence is collapsed by default to keep the view clean
 
 ### Export
-Generate a self-contained HTML diagnostic report from any loaded log bundle — includes Case Summary, all findings with severity, device info, enrollment state, network interfaces, EPDLP/SD-WAN/DEM sections, and the log file inventory. No external dependencies; the report opens in any browser.
+Generate a self-contained HTML diagnostic report from any loaded log bundle — includes Case Summary, all findings with severity, device info, enrollment state, network interfaces, EPDLP/SD-WAN/DEM sections, and the log file inventory.
 
 ---
 
-## Branches
+## Repository Structure
 
-| Branch | Status | Description |
-|---|---|---|
-| `main` | **Stable** | Recommended for field use |
-| `beta` | Development | Latest features; may contain work-in-progress |
+```
+index.html          ← current version of this branch (download this)
+releases/           ← archived prior releases (netskope_log_analyzer_vX.Y.Z.html)
+```
 
-Stable releases are tagged as `netskope_log_analyzer_vX.Y.Z.html` files in each branch. To roll back to a prior version, open the corresponding versioned file directly.
+The `main` branch always contains the latest stable release. The `beta` branch contains active development. Prior versions in `releases/` are provided for rollback — download the specific file and open it directly in your browser.
 
 ---
 
@@ -77,7 +77,13 @@ Stable releases are tagged as `netskope_log_analyzer_vX.Y.Z.html` files in each 
 - A modern browser (Chrome 90+, Edge 90+, Firefox 88+, Safari 15+)
 - A Netskope Client log bundle (ZIP exported from the client or collected via support tools)
 
-No internet connection is required after downloading the tool. All analysis runs locally in your browser — no log data is ever uploaded or transmitted.
+No internet connection is required after downloading the tool. All analysis runs locally — no log data is ever uploaded or transmitted.
+
+---
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).
 
 ---
 
